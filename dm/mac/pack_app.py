@@ -88,8 +88,8 @@ def min_os(host):   # the host's deployment target (LC_BUILD_VERSION minos): the
     return m.group(1) if m else '14.0'
 
 
-def swift_sources():   # the settings window, with the iOS launcher's model, rows and cloud-save report
-    return [HERE / 'Launcher.swift', HERE.parent / 'ios/Sources/LauncherSettings.swift', HERE.parent / 'ios/Sources/LauncherRow.swift', HERE.parent / 'ios/Sources/SaveSyncReport.swift']
+def swift_sources():   # the settings window and its Input tab, with the iOS launcher's model, rows and cloud-save report
+    return [HERE / 'Launcher.swift', HERE / 'LauncherControls.swift', HERE.parent / 'ios/Sources/LauncherSettings.swift', HERE.parent / 'ios/Sources/LauncherRow.swift', HERE.parent / 'ios/Sources/SaveSyncReport.swift']
 
 
 def build_launcher(out, minos, clang, swiftc, sdk):   # launcher.c's main and the host's cloud-save code (its send after the host exits), linked by swiftc with the settings window (no Swift main: -parse-as-library)
@@ -142,6 +142,18 @@ def source_commit():   # DMCommit: the checkout that packed the app (scripts/bug
         dirty = subprocess.run(['git', '-C', repo, 'status', '--porcelain', '--untracked-files=no'], capture_output=True, text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError): return None
     return head + ('+dirty' if dirty else '') if head else None
+
+
+def commit_url(commit):   # DMCommitURL: the packing commit's page on GitHub, when a branch of the origin remote has it (a local or dirty commit has none there)
+    if not commit or commit.endswith('+dirty'): return None
+    repo = HERE.parent.parent
+    def git(*a): return subprocess.run(['git', '-C', repo, *a], capture_output=True, text=True, check=True).stdout.strip()
+    try:
+        sha, remote = git('rev-parse', 'HEAD'), git('remote', 'get-url', 'origin')
+        if not git('branch', '-r', '--list', 'origin/*', '--contains', sha): return None
+    except (OSError, subprocess.CalledProcessError): return None
+    m = re.match(r'(?:https://github\.com/|git@github\.com:)([\w.-]+/[\w.-]+?)(?:\.git)?/?$', remote)
+    return f'https://github.com/{m.group(1)}/commit/{sha}' if m else None
 
 
 def strip_detritus(app):   # the "._name" files a copy from or onto an exFAT volume leaves in the bundle: codesign reads each one as a code object and refuses the bundle ("code object is not signed at all")
@@ -327,7 +339,7 @@ def pack(a):
         if not codesign: raise SystemExit('codesign is not available')
         codesign = Path(codesign).resolve()
         minos = min_os(a.host)
-        sources = [Path(__file__).resolve(), HERE / 'launcher.c', HERE.parent / 'host/romfs_image.h', HERE.parent / 'host/save_sync.c', HERE.parent / 'host/save_sync.h', HERE.parent / 'tools/romfs.py'] + swift_sources()
+        sources = [Path(__file__).resolve(), HERE / 'launcher.c', HERE.parent / 'host/romfs_image.h', HERE.parent / 'host/input_map.h', HERE.parent / 'host/dm_input.h', HERE.parent / 'host/save_sync.c', HERE.parent / 'host/save_sync.h', HERE.parent / 'tools/romfs.py'] + swift_sources()
         large = {*msls, *pso, *(p for x in programs for p in x[5])}   # the shader libraries and pipeline archives (13.5 GB for Ocarina of Time): by stat, as the RomFS trees below
         inputs = {'options': vars(a), 'files': [file_row(p, p in large) for p in files + sources],
                   'trees': [(p, inventory(Path(p))) for p in (a.romfs, a.aoc, a.html, *(str(x[1]) for x in programs), *(str(x[3]) for x in programs)) if p and Path(p).exists()],
@@ -406,6 +418,8 @@ def pack(a):
     info['DMModuleFiles'] = [p.name for p in mods]
     commit = source_commit()
     if commit: info['DMCommit'] = commit
+    url = commit_url(commit)
+    if url: info['DMCommitURL'] = url
     if msl_dst.name.startswith('b-'): info['DMChain'] = msl_dst.name[2:]   # the library chain the app carries (a Vulkan or GL game's vk / gl has none)
     (c / 'Info.plist').write_bytes(plistlib.dumps(info))
     (c / 'PkgInfo').write_text('APPL????')
