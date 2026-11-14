@@ -36,6 +36,8 @@
 #include "nvn_primitive.h"
 #include "nvn_link_drain.h"
 #include "nvn_timestamp.h"
+#include "mtl_stereo.h"
+#include <float.h>
 #include "msl_image.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree, one for every game (beside this file, tools/dmsh_chain.py --header)
 #include "game_profile.h"   // game profile constants (profile id, the profile's switches)
@@ -1633,6 +1635,7 @@ void mtl_sub_begin(void) {
 }
 
 static void rp_end_at(const char *fn, int line);
+static _Atomic int g_st_on; static void st_pass(MTL4RenderPassDescriptor *pd); static inline void st_draw(void); static void st_present(id<MTLTexture> src, const int crop[4]); static __thread uint64_t g_st_tag;   // the stereo tap (below present snapshots)
 // Every render pass end names its call site in a pass dump (E <pass> pass ends in <function>:<line>): a pass that ends with no record of its own was found only by reading the code (Splatoon Raiders'
 // third boss stage, about 1,500 one-draw passes a frame on its ink map, dm/games/0400380020056000/README.md). The line is in the file that holds the function (this one or an .inc it includes), at the build the log came from
 #define rp_end() rp_end_at(__func__, __LINE__)
@@ -6079,6 +6082,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     ser_gate();
     g_stat_pass++;   // gp_begin records this pass; match the attachment and draw dump labels
     g_enc = enc_r_begin_pass(pd);
+    if (atomic_load_explicit(&g_st_on, memory_order_relaxed)) st_pass(pd);
     args_dirty_all();
     if (enc_label_on()) { id<MTLTexture> lt = pd.colorAttachments[0].texture ?: pd.depthAttachment.texture ?: pd.stencilAttachment.texture; g_el_w = (int)lt.width; g_el_h = (int)lt.height; g_el_draws = 0; g_el_key[0] = 0; }
     return g_enc;
@@ -14882,7 +14886,7 @@ static int mdx_next(const p_draw *dw, const p_draw_idx *di) {
     if (!g_mdxc.next || g_mdxc.next != g_exec_cur || !g_enc || g_mdxc.enc != (__bridge const void *)g_enc || g_mdxc.pass != g_stat_pass || g_mdxc.cnt != cnt || g_mdxc.i + 1 != i
         || g_defer_replaying || passdump() || !mdx_find(dw ? dw->ind : di->ind, cnt, &out) || !out) return 0;
     if (dw) enc_r_draw_indirect(g_enc, g_mdxc.mp, out); else enc_r_draw_indexed_indirect(g_enc, g_mdxc.mp, g_mdxc.it, g_mdxc.ig, g_mdxc.il, out);
-    g_stat_draw++; g_mdx_fast++; g_mdxc.next = g_mdx_range ? g_exec_cur : g_exec_next; g_mdxc.i = i;
+    g_stat_draw++; g_mdx_fast++; if (atomic_load_explicit(&g_st_on, memory_order_relaxed)) st_draw(); g_mdxc.next = g_mdx_range ? g_exec_cur : g_exec_next; g_mdxc.i = i;
     return 1;
 }
 #include "nvn_feedback.inc"
@@ -15436,6 +15440,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
         }
     }
     g_stat_draw++;
+    if (atomic_load_explicit(&g_st_on, memory_order_relaxed)) st_draw();
     if (enc_label_on() && !g_el_draws++ && pr->sh[1]) { memcpy(g_el_key, pr->sh[1]->key, 8); g_el_key[8] = 0; }
     if (passdump()) {   // Characteristics of a render pass's first draw (to judge whether the load can be omitted: full screen, no blending, writes all channels, does not depend on depth); with DM_NVN_PASSDUMP_ALL every draw is recorded
         static uint64_t last_pass = ~0ull; static int all = -1; if (all < 0) all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
@@ -17866,6 +17871,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     pthread_mutex_unlock(&g_shotq_mu);
 
     if (atomic_load(&g_gpu_lost)) return 0;   // the display command buffer would be ignored too: take no drawable from the screen the front end is about to close
+    if (atomic_load_explicit(&g_st_on, memory_order_relaxed)) st_present(src, crop);   // the headset's copy, whether or not the window gives a drawable
     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
     if (!layer) return 0;
     if (g_present_layer_resident != layer) { [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }
@@ -17943,7 +17949,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 // Swapchain texture return: before AcquireTexture gets a texture it waits for the ticket of that texture's previous present to be processed (mtl_present_wait), after which the commands the game draws into it
 // are necessarily ordered after that blit on the GPU queue.
 #define PQ 8
-typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, snap_v, sub_v; } pq_item;   // snap_v: the snapshot copy this present shows (snap_commit_wait); sub_v: the submissions a present of the game's own texture follows (sub_commit_wait)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
+typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, snap_v, sub_v, st; } pq_item;   // st: the stereo tap's depth copy of this frame (st_take_depth)   // snap_v: the snapshot copy this present shows (snap_commit_wait); sub_v: the submissions a present of the game's own texture follows (sub_commit_wait)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
 // External producer (the Vulkan layer, dm/gfx/vk) renders on its own queue and signals this event when a frame's rendering is done: the present of that frame waits for the value on g_q4
 static id<MTLSharedEvent> g_ext_ev;
 static void ext_wait(uint64_t v) { if (v && g_ext_ev) [g_q4 waitForEvent:g_ext_ev value:v]; }
@@ -18035,7 +18041,7 @@ static void link_drain_note(double cb, double age, int dropped) {
     pthread_mutex_unlock(&g_pq_mu);
     link_drain_note(cb, cb - it.t_in, ticket > first);
     int submitted;
-    ext_wait(it.ev_val); snap_commit_wait(it.snap_v); sub_commit_wait(it.sub_v);
+    ext_wait(it.ev_val); snap_commit_wait(it.snap_v); sub_commit_wait(it.sub_v); g_st_tag = it.st;
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); mtl_tex_unpin(it.t.serial); }
     g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;
     if (!submitted) {
@@ -18179,7 +18185,7 @@ static void *present_main(void *arg) {
         uint64_t ticket = ++g_pq_read; g_classic_busy = 1;
         pthread_mutex_unlock(&g_pq_mu);
         int submitted;
-        ext_wait(it.ev_val); snap_commit_wait(it.snap_v); sub_commit_wait(it.sub_v);
+        ext_wait(it.ev_val); snap_commit_wait(it.snap_v); sub_commit_wait(it.sub_v); g_st_tag = it.st;
         @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, nil, 0); mtl_tex_unpin(it.t.serial); }
         pthread_mutex_lock(&g_pq_mu); g_classic_busy = 0; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
         if (!submitted) {
@@ -18342,6 +18348,162 @@ static uint64_t snap_take(const tex_t *t) {
     g_snap[k].ev = v;
     return g_snap[k].serial;
 }
+// ---------- Stereo tap (mtl_stereo.h; dm/host/immersive_mac.m draws the picture for each eye of a Vision Pro from it) ----------
+// Off unless mtl_stereo_enable(1). Each present's picture is drawn, as the screen gets it, into a ring of host textures (st_present), and the depth of the frame's scene is copied
+// into another (st_take_depth): the depth attachment that took the most depth-writing draws in passes with a colour attachment (a shadow map's pass has none). A consumer on another
+// queue pins the newest finished pair (mtl_stereo_acquire); a slot is written again only when nothing pins it and its last copy has run. NVN presents only have a depth: the Vulkan
+// and GL layers draw with their own encoders, so their pictures come without one
+#define ST_D 6
+#define ST_C 3
+#define ST_CAND 16
+static _Atomic int g_st_on;
+static pthread_mutex_t g_st_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { id<MTLTexture> tex; NSUInteger level, slice; uint32_t draws, rev; float x0, y0, x1, y1; } g_st_cand[ST_CAND];   // the frame being replayed; under g_st_mu but its counts
+static int g_st_ncand, g_st_cur = -1;
+static struct { id<MTLTexture> tex, src; uint64_t gen, ev; int pins, rev, flip; float rect[4]; } g_st_d[ST_D];
+static struct { id<MTLTexture> tex, view; int pins, busy; } g_st_c[ST_C];
+static struct { int c, d; uint64_t seq; } g_st_pub = {-1, -1, 0};
+static id<MTL4CommandAllocator> g_st_dalloc[ST_D], g_st_calloc[ST_C]; static id<MTL4CommandBuffer> g_st_dcb[ST_D], g_st_ccb[ST_C]; static id<MTLBuffer> g_st_uv[ST_C];
+static id<MTLResidencySet> g_st_res; static id<MTLSharedEvent> g_st_ev; static uint64_t g_st_v, g_st_gen;
+static __thread uint64_t g_st_tag;   // the depth copy of the present being processed (pq_item.st), for st_present
+void mtl_stereo_enable(int on) { if (atomic_exchange(&g_st_on, on != 0) != (on != 0)) MLOG("stereo tap %s", on ? "on: each present's picture and its scene depth are copied for the headset" : "off"); }
+// Pass begin (submit thread): the pass's depth attachment becomes the candidate its draws count for
+static void st_pass(MTL4RenderPassDescriptor *pd) {
+    g_st_cur = -1;
+    id<MTLTexture> t = pd.depthAttachment.texture;
+    if (!t || !pd.colorAttachments[0].texture || t.sampleCount != 1 || (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray)) return;
+    NSUInteger lv = pd.depthAttachment.level, sl = pd.depthAttachment.slice;
+    pthread_mutex_lock(&g_st_mu);
+    int i = 0; while (i < g_st_ncand && !(g_st_cand[i].tex == t && g_st_cand[i].level == lv && g_st_cand[i].slice == sl)) i++;
+    if (i == g_st_ncand && i < ST_CAND) { g_st_cand[i].tex = t; g_st_cand[i].level = lv; g_st_cand[i].slice = sl; g_st_cand[i].draws = g_st_cand[i].rev = 0;
+        g_st_cand[i].x0 = g_st_cand[i].y0 = FLT_MAX; g_st_cand[i].x1 = g_st_cand[i].y1 = -FLT_MAX; g_st_ncand++; }
+    if (i < g_st_ncand) g_st_cur = i;
+    pthread_mutex_unlock(&g_st_mu);
+}
+// A draw (submit thread): one that tests and writes depth counts for its pass's candidate, with its viewport (the part of the attachment the scene covers: a game with a dynamic
+// resolution draws into a corner of it) and its compare's direction (GREATER / GEQUAL: the far plane is 0)
+static inline void st_draw(void) {
+    int i = g_st_cur; if (i < 0 || !S.ds.dt || !S.ds.dw) return;
+    g_st_cand[i].draws++; if (S.ds.df == NVN_DEPTH_FUNC_GREATER || S.ds.df == NVN_DEPTH_FUNC_GEQUAL) g_st_cand[i].rev++;
+    if (S.has_vp) { float a = S.vp[0][0], b = S.vp[0][1], c = a + S.vp[0][2], d = b + S.vp[0][3];
+        g_st_cand[i].x0 = MIN(g_st_cand[i].x0, MIN(a, c)); g_st_cand[i].x1 = MAX(g_st_cand[i].x1, MAX(a, c)); g_st_cand[i].y0 = MIN(g_st_cand[i].y0, MIN(b, d)); g_st_cand[i].y1 = MAX(g_st_cand[i].y1, MAX(b, d)); }
+    else { g_st_cand[i].x0 = g_st_cand[i].y0 = 0; g_st_cand[i].x1 = g_st_cand[i].y1 = FLT_MAX; }
+}
+static void st_init(void) {
+    if (g_st_ev) return;
+    g_st_ev = [g_dev newSharedEvent];
+    MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new]; rd.initialCapacity = 2 * ST_D + ST_C; NSError *e = nil;
+    g_st_res = [g_dev newResidencySetWithDescriptor:rd error:&e]; if (!g_st_res) MDIE("stereo tap: no residency set: %s", e.localizedDescription.UTF8String);
+    [g_q4 addResidencySet:g_st_res];
+    for (int i = 0; i < ST_D; i++) { g_st_dalloc[i] = [g_dev newCommandAllocator]; g_st_dcb[i] = [g_dev newCommandBuffer]; }
+    for (int i = 0; i < ST_C; i++) { g_st_calloc[i] = [g_dev newCommandAllocator]; g_st_ccb[i] = [g_dev newCommandBuffer]; g_st_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; [g_st_res addAllocation:g_st_uv[i]]; }
+    [g_st_res commit];
+}
+// Where the game queues the present (present_enqueue), so the copy comes after the frame's work and before the next frame's on the queue, as a present snapshot's does (snap_take).
+// Returns the copy's tag for pq_item.st (generation << 8 | slot + 1), 0 = the frame has no scene depth or no slot is free
+static uint64_t st_take_depth(void) {
+    pthread_mutex_lock(&g_st_mu);
+    int b = -1; for (int i = 0; i < g_st_ncand; i++) if (g_st_cand[i].draws && (b < 0 || g_st_cand[i].draws > g_st_cand[b].draws)) b = i;
+    id<MTLTexture> src = b >= 0 ? g_st_cand[b].tex : nil; NSUInteger lv = 0, sl = 0; float rc[4] = {0, 0, 1, 1}; int rev = 0;
+    if (src) { lv = g_st_cand[b].level; sl = g_st_cand[b].slice; rev = g_st_cand[b].rev * 2 > g_st_cand[b].draws;
+        float w = MAX(1, src.width >> lv), h = MAX(1, src.height >> lv);
+        float x0 = MAX(0, g_st_cand[b].x0), y0 = MAX(0, g_st_cand[b].y0), x1 = MIN(w, g_st_cand[b].x1), y1 = MIN(h, g_st_cand[b].y1);
+        if (x1 > x0 && y1 > y0) { rc[0] = x0 / w; rc[1] = y0 / h; rc[2] = (x1 - x0) / w; rc[3] = (y1 - y0) / h; } }
+    for (int i = 0; i < g_st_ncand; i++) g_st_cand[i].tex = nil;
+    g_st_ncand = 0; g_st_cur = -1;
+    int k = -1;
+    if (src) { st_init(); uint64_t done = g_st_ev.signaledValue;
+        for (int i = 0; i < ST_D; i++) if (!g_st_d[i].pins && i != g_st_pub.d && g_st_d[i].ev <= done && (k < 0 || g_st_d[i].gen < g_st_d[k].gen)) k = i; }
+    if (k < 0) { pthread_mutex_unlock(&g_st_mu); return 0; }
+    NSUInteger w = MAX(1, src.width >> lv), h = MAX(1, src.height >> lv);
+    id<MTLTexture> dst = g_st_d[k].tex;
+    if (!dst || dst.width != w || dst.height != h || dst.pixelFormat != src.pixelFormat) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:src.pixelFormat width:w height:h mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageShaderRead;
+        if (dst) [g_st_res removeAllocation:dst];   // nothing pins it and its last copy has run (the slot's choice above)
+        dst = [g_dev newTextureWithDescriptor:d]; if (!dst) { pthread_mutex_unlock(&g_st_mu); RED_ONCE(171, "stereo tap: no depth texture"); return 0; }
+        [g_st_res addAllocation:dst]; g_st_d[k].tex = dst;
+        MLOG("stereo tap: depth slot %d %lux%lu format %lu", k, (unsigned long)w, (unsigned long)h, (unsigned long)dst.pixelFormat);
+    }
+    // The source stays resident for this copy whatever the game does with it before the queue runs it (a texture freed in the same frame leaves the frame's own set)
+    if (g_st_d[k].src != src) { if (g_st_d[k].src) [g_st_res removeAllocation:g_st_d[k].src]; [g_st_res addAllocation:src]; g_st_d[k].src = src; }
+    [g_st_res commit];
+    [g_st_dalloc[k] reset];
+    id<MTL4CommandBuffer> cb = g_st_dcb[k];
+    [cb beginCommandBufferWithAllocator:g_st_dalloc[k]];
+    id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];
+    [ce copyFromTexture:src sourceSlice:sl sourceLevel:lv sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];
+    [ce endEncoding]; [cb endCommandBuffer];
+    uint64_t v = ++g_st_v, gen = ++g_st_gen;
+    g_st_d[k].ev = v; g_st_d[k].gen = gen; g_st_d[k].rev = rev; g_st_d[k].flip = atomic_load_explicit(&g_origin_ll, memory_order_relaxed); memcpy(g_st_d[k].rect, rc, sizeof rc);
+    pthread_mutex_unlock(&g_st_mu);
+    if (rec_on() && g_rb_started) {   // a block of the encode thread's queue, behind the frame's work (as snap_take)
+        if (on_sub_thread()) rec_publish();
+        rec_blk *bk = rec_own_begin();
+        rec_t *r = rec_own_put(bk, RO_COMMIT_REAL, 2); r->a[0] = 0; r->a[1] = rec_obj(cb);
+        r = rec_own_put(bk, RO_SIGNAL, 1); r->a[0] = rec_obj(g_st_ev); r->a[1] = v;
+        rec_own_push(bk);
+    } else { pthread_mutex_lock(&g_res_commit_mu); [g_q4 commit:&cb count:1]; [g_q4 signalEvent:g_st_ev value:v]; pthread_mutex_unlock(&g_res_commit_mu); }
+    return gen << 8 | (uint64_t)(k + 1);
+}
+// The present thread (present_now): the picture as the screen gets it (crop, shape, origin), drawn 1:1 into a ring slot; its feedback publishes it with the frame's depth copy
+static void st_present(id<MTLTexture> src, const int crop[4]) {
+    NSUInteger r[4]; if (!present_crop_rect(src, crop, r)) return;
+    double pw, ph; present_shape(src, &pw, &ph);
+    NSUInteger w = MAX(r[2], (NSUInteger)lround(r[3] * pw / ph)), h = (NSUInteger)lround(w * ph / pw); if (!w || !h) return;
+    uint64_t tag = g_st_tag;
+    pthread_mutex_lock(&g_st_mu);
+    st_init();
+    int k = -1; for (int i = 0; i < ST_C && k < 0; i++) if (!g_st_c[i].pins && !g_st_c[i].busy && i != g_st_pub.c) k = i;
+    if (k < 0) { pthread_mutex_unlock(&g_st_mu); return; }   // the headset's loop holds the others: this frame is not shown there
+    id<MTLTexture> dst = g_st_c[k].tex;
+    if (!dst || dst.width != w || dst.height != h) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+        if (dst) [g_st_res removeAllocation:dst];
+        dst = [g_dev newTextureWithDescriptor:d]; if (!dst) { pthread_mutex_unlock(&g_st_mu); RED_ONCE(172, "stereo tap: no colour texture"); return; }
+        [g_st_res addAllocation:dst]; [g_st_res commit];
+        g_st_c[k].tex = dst; g_st_c[k].view = [dst newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];   // the picture's bytes are gamma-encoded: the headset's pass samples them decoded
+        MLOG("stereo tap: colour slot %d %lux%lu", k, (unsigned long)w, (unsigned long)h);
+    }
+    g_st_c[k].busy = 1;
+    pthread_mutex_unlock(&g_st_mu);
+    [g_st_calloc[k] reset];
+    id<MTL4CommandBuffer> cb = g_st_ccb[k];
+    [cb beginCommandBufferWithAllocator:g_st_calloc[k]];
+    int kind = present_encode_m4(cb, src, dst, crop, g_st_uv[k], NULL);
+    [cb endCommandBuffer];
+    if (!kind) { pthread_mutex_lock(&g_st_mu); g_st_c[k].busy = 0; pthread_mutex_unlock(&g_st_mu); return; }
+    MTL4CommitOptions *o = [MTL4CommitOptions new];
+    [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+        if (f.error) { MLOG("[RED] stereo tap: %s", f.error.description.UTF8String); gpu_lost_check(f.error, "stereo tap"); }
+        pthread_mutex_lock(&g_st_mu);
+        g_st_c[k].busy = 0;
+        if (!f.error) { int d = (int)(tag & 0xff) - 1; if (d >= 0 && g_st_d[d].gen != tag >> 8) d = -1;   // its slot was taken again since: this frame goes without depth
+            g_st_pub.c = k; g_st_pub.d = d; g_st_pub.seq++; }
+        pthread_mutex_unlock(&g_st_mu);
+    }];
+    [g_q4 commit:&cb count:1 options:o];
+}
+int mtl_stereo_acquire(mtl_stereo_frame *f) {
+    memset(f, 0, sizeof *f); f->c = f->d = -1;
+    pthread_mutex_lock(&g_st_mu);
+    int c = g_st_pub.c, d = g_st_pub.d;
+    if (c < 0) { pthread_mutex_unlock(&g_st_mu); return 0; }
+    if (d >= 0 && g_st_ev.signaledValue < g_st_d[d].ev) d = -1;   // its copy has not run yet
+    g_st_c[c].pins++; f->c = c; f->color = (__bridge void *)g_st_c[c].view; f->seq = g_st_pub.seq;
+    if (d >= 0) { g_st_d[d].pins++; f->d = d; f->depth = (__bridge void *)g_st_d[d].tex; f->depth_rev = g_st_d[d].rev; f->depth_flip = g_st_d[d].flip; memcpy(f->depth_rect, g_st_d[d].rect, sizeof f->depth_rect); }
+    pthread_mutex_unlock(&g_st_mu);
+    return 1;
+}
+void mtl_stereo_release(const mtl_stereo_frame *f) {
+    pthread_mutex_lock(&g_st_mu);
+    if (f->c >= 0) g_st_c[f->c].pins--;
+    if (f->d >= 0) g_st_d[f->d].pins--;
+    pthread_mutex_unlock(&g_st_mu);
+}
 // copy (may be NULL): the g_snap_ev value of the snapshot copy this present took, 0 when it took none (mtl_present_wait_texture)
 static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val, uint64_t *copy) {
     atomic_store(&dm_present_ns, now_ns()); if (copy) *copy = 0;
@@ -18363,6 +18525,7 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
         else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL: resuming the display link (frame %llu)", (unsigned long long)atomic_load(&g_cur_frame)); }
     }
     if (ws_on()) { static uint64_t f0; uint64_t f = atomic_load(&g_cur_frame); if (!f0) f0 = f; else if (f >= f0 + 300) { ws_report(f, f - f0); f0 = f; } }
+    uint64_t st = !ev_val && atomic_load_explicit(&g_st_on, memory_order_relaxed) ? st_take_depth() : 0;
     tex_t snap; uint64_t ss = 0; int slot = 0;
     if (!ev_val && mtl_snap_on()) {
         slot = (int)(atomic_load(&g_snap_next) % (uint64_t)g_snap_n);
@@ -18371,7 +18534,7 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
     if (t->serial < EXT_SERIAL) mtl_tex_pin(t->serial);   // an external texture is the present path's until mtl_ext_tex_release, which waits for its presents (the unpins find no pin)
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // Wait only when the queue is full; normally AcquireTexture blocks first
-    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, ss ? g_snap[slot].ev : 0, !ss && !ev_val && on_sub_thread() ? g_fence : 0};
+    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, ss ? g_snap[slot].ev : 0, !ss && !ev_val && on_sub_thread() ? g_fence : 0, st};
     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
     uint64_t tk = ++g_pq_in;
     g_pres_tin[tk % PRING] = it->t_in;
