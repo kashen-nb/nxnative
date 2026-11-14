@@ -14,7 +14,6 @@ id<MTLBuffer> dm_immersive_eyes(const mtl_stereo_frame *f, int measure, NSUInteg
 void dm_immersive_scene_open(void);
 // The scene's reports: why the space did not open, or that it closed (main thread)
 void dm_immersive_note(const char *what);
-// front_mac.m: start (DM_IMMERSIVE, DM_IMMERSIVE_SHOT) once the window is up; whether DM_IMMERSIVE asked for the headset; put the screen back in front of the player
+// front_mac.m: start (DM_IMMERSIVE, DM_IMMERSIVE_SHOT) once the window is up; whether DM_IMMERSIVE asked for the headset
 void dm_immersive_start(void);
 int dm_immersive_wanted(void);
-void dm_immersive_recenter(void);

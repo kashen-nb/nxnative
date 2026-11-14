@@ -1559,13 +1559,6 @@ static NSArray<NSURL *> *found_cheat_files(NSString *build) {
 }
 @end
 
-@interface DmImmersiveMenu : NSObject
-+ (instancetype)shared;
-@end
-@implementation DmImmersiveMenu
-+ (instancetype)shared { static DmImmersiveMenu *m; if (!m) m = [DmImmersiveMenu new]; return m; }
-- (void)recenterScreen:(id)sender { (void)sender; dm_immersive_recenter(); }
-@end
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -1621,8 +1614,6 @@ void front_run(void (*guest)(void)) {
             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
-        if (dm_immersive_wanted())   // the screen on the Vision Pro, in front of the player again (immersive_mac.m)
-            [wm addItemWithTitle:@"Recenter Screen" action:@selector(recenterScreen:) keyEquivalent:@"0"].target = [DmImmersiveMenu shared];
         NSApp.mainMenu = bar;
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
         if (fs && strcmp(fs, "0")) {

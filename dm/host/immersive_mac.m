@@ -1,10 +1,12 @@
 // The game on a Vision Pro (immersive_mac.h). The Metal backend's stereo tap (dm/gfx/nvn/mtl_stereo.h) gives each present's picture and the depth of its scene; this file draws the
 // picture on a screen in the player's room once for each eye (dm/gfx/msl/stereo.metal), at the headset's rate, on a queue of its own, whatever rate the game presents at.
-// - The screen: DM_IMMERSIVE_SCREEN=<width m>,<distance m> (3.2 m wide, 2.5 m away), placed in front of the player at the first pose and again on Recenter (front_mac.m's Window menu).
+// - The screen: DM_IMMERSIVE_SCREEN=<width m>,<distance m> (3.2 m wide, 2.5 m away), placed in front of the player at the first pose of each connection. Hold the Digital Crown to recenter.
 // - The depth: DM_IMMERSIVE_3D=<strength> (1; 0 = a flat picture). The farthest point lies 1.2 % of the picture's width behind the screen for each unit, the nearest at most half that
 //   in front of it. The screen's plane follows the nearest things in the scene (conv_update), so the scene opens behind the screen like a window.
 // - DM_IMMERSIVE_SHOT=<present>:<path.png>: without a headset, both eyes' pictures of that present side by side (left | right) as a PNG, through the same pass (a check of the tap and the shader)
-// Open: a picture drawn over the scene (a HUD) takes the depth of what is behind it; a Vulkan or GL game has no depth and stays flat; the game is paced by the Mac's display, whose
+// - A HUD: drawn over the scene without its depth, it is told from the scene by the picture before the game's overlays (the tap's base) and drawn in front of the scene. When
+//   overlays cover more than HUD_MAX of the picture, it is an effect over the whole picture (a fade, a vignette) or a menu: nothing is drawn apart.
+// Open: a HUD the game draws into the scene's own target before the composite stays with the scene; a Vulkan or GL game has no depth and stays flat; the game is paced by the Mac's display, whose
 // window must stay visible
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
@@ -23,12 +25,13 @@ void *mtl_device(void); uint64_t mtl_present_count(void);
 
 typedef struct { simd_float4x4 mvp; simd_float4 drect, par; simd_uint4 opt; } st_u;   // stereo.metal U
 #define NEAR_W 32
+#define HUD_MAX 0.6f
 #define NEAR_H 18
 static id<MTLDevice> g_dev; static id<MTLCommandQueue> g_q; static id<MTLLibrary> g_lib;
 static id<MTLSamplerState> g_ls, g_ns; static id<MTLDepthStencilState> g_dss; static id<MTLTexture> g_nodepth, g_near_tex; static id<MTLRenderPipelineState> g_near_pso;
 static float g_screen_w = 3.2f, g_screen_d = 2.5f, g_strength = 1;
 static _Atomic int g_recenter = 1;
-static pthread_mutex_t g_conv_mu = PTHREAD_MUTEX_INITIALIZER; static float g_conv; static double g_conv_t; static uint64_t g_conv_seq;   // the screen's plane (w), smoothed; the frame it was last measured on
+static pthread_mutex_t g_conv_mu = PTHREAD_MUTEX_INITIALIZER; static float g_conv, g_hud = 1; static double g_conv_t; static uint64_t g_conv_seq;   // the screen's plane (w), smoothed; the share of the picture overlays cover; the frame they were last measured on
 
 static int st_setup(void) {
     if (g_q) return 1;
@@ -40,11 +43,11 @@ static int st_setup(void) {
     MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new]; dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = YES; g_dss = [g_dev newDepthStencilStateWithDescriptor:dd];
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float width:1 height:1 mipmapped:NO];
     td.usage = MTLTextureUsageShaderRead; td.storageMode = MTLStorageModePrivate; g_nodepth = [g_dev newTextureWithDescriptor:td];
-    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:NEAR_W height:NEAR_H mipmapped:NO];
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG32Float width:NEAR_W height:NEAR_H mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModePrivate; g_near_tex = [g_dev newTextureWithDescriptor:td];
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     pd.vertexFunction = [g_lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [g_lib newFunctionWithName:@"fs_near"];
-    pd.colorAttachments[0].pixelFormat = MTLPixelFormatR32Float; pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRG32Float; pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     g_near_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
     if (!g_near_pso) { ILOG("[RED] no pipeline for the depth grid: %s", e.localizedDescription.UTF8String); return 0; }
     g_q = [g_dev newCommandQueue];
@@ -65,47 +68,51 @@ static id<MTLRenderPipelineState> st_pipeline(MTLPixelFormat cf, MTLPixelFormat 
     return made[key] = p;
 }
 // The constants of one eye's draw. eye: -1 left, 1 right, 0 none (a flat picture)
-static st_u st_uniforms(const mtl_stereo_frame *f, simd_float4x4 mvp, int eye, unsigned layer, float conv) {
+static st_u st_uniforms(const mtl_stereo_frame *f, simd_float4x4 mvp, int eye, unsigned layer, float conv, int hud) {
     st_u u = {mvp};
     if (f->depth) { const float *r = f->depth_rect; u.drect = f->depth_flip ? simd_make_float4(r[0], r[1] + r[3], r[2], -r[3]) : simd_make_float4(r[0], r[1], r[2], r[3]); }
     // the far parallax stays under the distance between the eyes on the screen, so the eyes never have to turn outwards
     float far = fminf(0.012f * g_strength, 0.055f / g_screen_w);
     u.par = simd_make_float4(0.5f * eye, far, far * 0.5f, f->depth && eye && far > 0 ? conv : 0);
-    u.opt = simd_make_uint4(layer, f->depth_rev != 0, 0, 0);
+    u.opt = simd_make_uint4(layer, f->depth_rev != 0, f->base && hud, 0);
     return u;
 }
 static void st_draw(id<MTLRenderCommandEncoder> en, const mtl_stereo_frame *f, const st_u *u) {
     [en setVertexBytes:u length:sizeof *u atIndex:0]; [en setFragmentBytes:u length:sizeof *u atIndex:0];
     [en setFragmentTexture:(__bridge id<MTLTexture>)f->color atIndex:0]; [en setFragmentTexture:f->depth ? (__bridge id<MTLTexture>)f->depth : g_nodepth atIndex:1];
+    [en setFragmentTexture:(__bridge id<MTLTexture>)(f->base ?: f->color) atIndex:2];
     [en setFragmentSamplerState:g_ls atIndex:0]; [en setFragmentSamplerState:g_ns atIndex:1];
     [en drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 }
 // Where the screen's plane lies in a frame's scene: the 90th percentile of the grid's nearest w, so what is nearest the camera (the ground at the player's feet) lies at the screen or
 // a little in front of it and everything else behind. 0 when under a twentieth of the grid holds anything (a menu over a cleared depth): flat
-static float conv_of(const float *w) {
+static float conv_of(const float *g) {   // g: the grid's (nearest w, overlay share) pairs
     float v[NEAR_W * NEAR_H]; int n = 0;
-    for (int i = 0; i < NEAR_W * NEAR_H; i++) if (w[i] > 1e-7f && w[i] <= 1) { float x = w[i]; int j = n++; while (j > 0 && v[j - 1] > x) { v[j] = v[j - 1]; j--; } v[j] = x; }
+    for (int i = 0; i < NEAR_W * NEAR_H; i++) if (g[2 * i] > 1e-7f && g[2 * i] <= 1) { float x = g[2 * i]; int j = n++; while (j > 0 && v[j - 1] > x) { v[j] = v[j - 1]; j--; } v[j] = x; }
     return n < NEAR_W * NEAR_H / 20 ? 0 : v[(n - 1) * 9 / 10];
 }
 // A new frame's depth grid, encoded into cb; its completion moves the plane towards the frame's (half the way in 0.25 s: a cut does not jump, a walk does not swim). wait: the plane
 // is set to the frame's at once and the call returns when it is (DM_IMMERSIVE_SHOT)
 static void conv_update(id<MTLCommandBuffer> cb, const mtl_stereo_frame *f, int wait) {
     pthread_mutex_lock(&g_conv_mu); int seen = g_conv_seq == f->seq; g_conv_seq = f->seq; pthread_mutex_unlock(&g_conv_mu);
-    if (seen || !f->depth) { if (!f->depth && !seen) { pthread_mutex_lock(&g_conv_mu); g_conv = 0; pthread_mutex_unlock(&g_conv_mu); } return; }
+    if (seen || !f->depth) { if (!f->depth && !seen) { pthread_mutex_lock(&g_conv_mu); g_conv = 0; g_hud = 1; pthread_mutex_unlock(&g_conv_mu); } return; }
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor new];
     rp.colorAttachments[0].texture = g_near_tex; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.renderTargetArrayLength = 1;   // the vertex shader names a layer
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
-    st_u u = st_uniforms(f, matrix_identity_float4x4, 0, 0, 0);
+    st_u u = st_uniforms(f, matrix_identity_float4x4, 0, 0, 0, 1);
     [en setRenderPipelineState:g_near_pso]; [en setVertexBytes:&u length:sizeof u atIndex:0]; [en setFragmentBytes:&u length:sizeof u atIndex:0];
-    [en setFragmentTexture:(__bridge id<MTLTexture>)f->depth atIndex:1]; [en setFragmentSamplerState:g_ns atIndex:1];
+    [en setFragmentTexture:(__bridge id<MTLTexture>)f->color atIndex:0]; [en setFragmentTexture:(__bridge id<MTLTexture>)f->depth atIndex:1];
+    [en setFragmentTexture:(__bridge id<MTLTexture>)(f->base ?: f->color) atIndex:2]; [en setFragmentSamplerState:g_ns atIndex:1];
     [en drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4]; [en endEncoding];
-    id<MTLBuffer> out = [g_dev newBufferWithLength:NEAR_W * NEAR_H * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_dev newBufferWithLength:NEAR_W * NEAR_H * 8 options:MTLResourceStorageModeShared];
     id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
-    [b copyFromTexture:g_near_tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(NEAR_W, NEAR_H, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:NEAR_W * 4 destinationBytesPerImage:NEAR_W * NEAR_H * 4];
+    [b copyFromTexture:g_near_tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(NEAR_W, NEAR_H, 1) toBuffer:out destinationOffset:0 destinationBytesPerRow:NEAR_W * 8 destinationBytesPerImage:NEAR_W * NEAR_H * 8];
     [b endEncoding];
     void (^done)(void) = ^{
-        float c = conv_of(out.contents); double now = CACurrentMediaTime();
+        const float *g = out.contents; float c = conv_of(g), hud = 0; double now = CACurrentMediaTime();
+        for (int i = 0; i < NEAR_W * NEAR_H; i++) hud += g[2 * i + 1] / (NEAR_W * NEAR_H);
         pthread_mutex_lock(&g_conv_mu);
+        g_hud = hud;
         if (wait || g_conv <= 0 || c <= 0) g_conv = c; else g_conv += (c - g_conv) * (float)(1 - exp2(-(now - g_conv_t) / 0.25));
         g_conv_t = now;
         pthread_mutex_unlock(&g_conv_mu);
@@ -114,6 +121,7 @@ static void conv_update(id<MTLCommandBuffer> cb, const mtl_stereo_frame *f, int 
     id<MTLCommandBuffer> own = cb; [own commit]; [own waitUntilCompleted]; done();
 }
 static float conv_now(void) { pthread_mutex_lock(&g_conv_mu); float c = g_conv; pthread_mutex_unlock(&g_conv_mu); return c; }
+static float hud_now(void) { pthread_mutex_lock(&g_conv_mu); float h = g_hud; pthread_mutex_unlock(&g_conv_mu); return h; }   // the share of the picture overlays cover
 
 // ---------- DM_IMMERSIVE_SHOT ----------
 // Both eyes' pictures of a frame through the headset's pass (a target of two layers, no lens map, the screen filling it): BGRA bytes, the left eye's rows then the right's.
@@ -135,8 +143,8 @@ id<MTLBuffer> dm_immersive_eyes(const mtl_stereo_frame *f, int measure, NSUInteg
     rp.depthAttachment.texture = zt; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionDontCare; rp.renderTargetArrayLength = 2;
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
     [en setRenderPipelineState:pso]; [en setDepthStencilState:g_dss];
-    float conv = conv_now();
-    for (int i = 0; i < 2; i++) { st_u u = st_uniforms(f, matrix_identity_float4x4, i ? 1 : -1, (unsigned)i, conv); st_draw(en, f, &u); }
+    float conv = conv_now(); int hud = hud_now() <= HUD_MAX;
+    for (int i = 0; i < 2; i++) { st_u u = st_uniforms(f, matrix_identity_float4x4, i ? 1 : -1, (unsigned)i, conv, hud); st_draw(en, f, &u); }
     [en endEncoding];
     id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
     for (int i = 0; i < 2; i++) [b copyFromTexture:out sourceSlice:(NSUInteger)i sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toBuffer:px destinationOffset:(NSUInteger)i * w * h * 4 destinationBytesPerRow:w * 4 destinationBytesPerImage:w * h * 4];
@@ -157,11 +165,12 @@ static void shot_thread(const char *path, uint64_t at) { @autoreleasepool {
     CGImageDestinationRef dst = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:@(path)], (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL);
     int ok = 0; if (dst && im) { CGImageDestinationAddImage(dst, im, NULL); ok = CGImageDestinationFinalize(dst); }
     if (dst) CFRelease(dst); if (im) CGImageRelease(im); CGDataProviderRelease(dp); CGColorSpaceRelease(cs);
-    id<MTLTexture> z = (__bridge id<MTLTexture>)f.depth; float conv = conv_now();
-    ILOG("%sDM_IMMERSIVE_SHOT: present %llu, picture %lux%lu, %s, screen plane w %.6g%s: %s", ok ? "" : "[RED] ", (unsigned long long)at, (unsigned long)w, (unsigned long)h,
+    id<MTLTexture> z = (__bridge id<MTLTexture>)f.depth; float conv = conv_now(), hud = hud_now();
+    ILOG("%sDM_IMMERSIVE_SHOT: present %llu, picture %lux%lu, %s, screen plane w %.6g%s, %s: %s", ok ? "" : "[RED] ", (unsigned long long)at, (unsigned long)w, (unsigned long)h,
          z ? [NSString stringWithFormat:@"depth %lux%lu format %lu (scene at %.3f,%.3f %.3fx%.3f, far plane %d%s)", (unsigned long)z.width, (unsigned long)z.height,
               (unsigned long)z.pixelFormat, f.depth_rect[0], f.depth_rect[1], f.depth_rect[2], f.depth_rect[3], !f.depth_rev, f.depth_flip ? ", bottom-up" : ""].UTF8String : "no depth",
-         conv, conv > 0 ? "" : " (flat)", ok ? path : "could not write the file");
+         conv, conv > 0 ? "" : " (flat)",
+         !f.base ? "no overlays" : [NSString stringWithFormat:@"overlays over %.1f %% of the picture%s", hud * 100, hud <= HUD_MAX ? ", in front" : ", over the whole picture: not drawn apart"].UTF8String, ok ? path : "could not write the file");
     mtl_stereo_release(&f);
 } }
 
@@ -188,7 +197,7 @@ static void render_drawable(cp_drawable_t dr, ar_world_tracking_provider_t wt, c
         conv_update(cb, f, 0);
     }
     size_t nv = cp_drawable_get_view_count(dr), nt = cp_drawable_get_texture_count(dr), nr = cp_drawable_get_rasterization_rate_map_count(dr);
-    float conv = conv_now();
+    float conv = conv_now(); int hud = hud_now() <= HUD_MAX;
     for (size_t t = 0; t < nt; t++) {   // one pass a texture: a layered layout has one of two layers, a dedicated one two, a shared one one that both eyes' viewports lie in
         id<MTLTexture> ct = cp_drawable_get_color_texture(dr, t), zt = cp_drawable_get_depth_texture(dr, t);
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor new];
@@ -207,7 +216,7 @@ static void render_drawable(cp_drawable_t dr, ar_world_tracking_provider_t wt, c
                 simd_float4x4 mvp = simd_mul(cp_drawable_compute_projection(dr, cp_axis_direction_convention_right_up_back, i), simd_mul(simd_inverse(eye), model));
                 // which eye a view is: its place to the left or right of the head (one view: a flat picture)
                 int side = nv < 2 ? 0 : cp_view_get_transform(v).columns[3].x < 0 ? -1 : 1;
-                st_u u = st_uniforms(f, mvp, side, (unsigned)cp_view_texture_map_get_slice_index(map), conv);
+                st_u u = st_uniforms(f, mvp, side, (unsigned)cp_view_texture_map_get_slice_index(map), conv, hud);
                 [en setViewport:cp_view_texture_map_get_viewport(map)];
                 st_draw(en, f, &u);
             }
@@ -263,7 +272,6 @@ void dm_immersive_render(cp_layer_renderer_t layer, ar_device_t device) {
     pthread_detach(th);
 }
 void dm_immersive_note(const char *what) { ILOG("%s", what); }
-void dm_immersive_recenter(void) { atomic_store(&g_recenter, 1); }
 int dm_immersive_wanted(void) { const char *e = getenv("DM_IMMERSIVE"); return e && atoi(e); }
 void dm_immersive_start(void) {
     const char *shot = getenv("DM_IMMERSIVE_SHOT"), *colon = shot ? strchr(shot, ':') : NULL;

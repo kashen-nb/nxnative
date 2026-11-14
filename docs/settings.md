@@ -233,9 +233,9 @@ Turn off **Show this window at launch** to start the game at once with your choi
 
 ### Apple Vision Pro
 
-**Off** by default. On, the game also appears on a large screen in front of you in an Apple Vision Pro near this Mac, in 3D: the Mac draws a picture for each eye from the game's own depth, so the scene opens behind the screen like a window. The Vision Pro asks you to accept the connection when the game starts. The game's window stays open on the Mac and must stay visible, since it still paces the game; controllers and the keyboard work as before. **Window › Recenter Screen** (⌘0) puts the screen back in front of you.
+**Off** by default. On, the game also appears on a large screen in front of you in an Apple Vision Pro near this Mac, in 3D: the Mac draws a picture for each eye from the game's own depth, so the scene opens behind the screen like a window. The Vision Pro asks you to accept the connection when the game starts. The game's window stays open on the Mac and must stay visible, since it still paces the game; controllers and the keyboard work as before. Hold the Digital Crown to recenter the screen.
 
-**3D depth** sets how deep the picture is (0 is flat). A game's HUD takes the depth of what is behind it, and a game drawn through Vulkan or OpenGL, or a 2D game, stays flat. In an `env.txt`: `DM_IMMERSIVE=1`, `DM_IMMERSIVE_3D=0` to `2`. It needs macOS 26 and visionOS 26, and has not been tested on a headset yet.
+**3D depth** sets how deep the picture is (0 is flat). The game's HUD floats in front of the scene. A game drawn through Vulkan or OpenGL, or a 2D game, stays flat. In an `env.txt`: `DM_IMMERSIVE=1`, `DM_IMMERSIVE_3D=0` to `2`. It needs macOS 26 and visionOS 26. Tested on a Mac and a physical Apple Vision Pro.
 
 ### Switch 2 controllers
 

@@ -1,5 +1,6 @@
 // The stereo tap (nvn_mtl.m, mtl_stereo.h) and the headset's pass (dm/host/immersive_mac.m, msl/stereo.metal), without a headset: a frame whose scene has a far third, a middle
-// and a small near patch is tapped as a game's would be, and each eye's picture must show the far marker behind the screen, the middle one on it and the near one in front
+// and a small near patch is tapped as a game's would be, and each eye's picture must show the far marker behind the screen, the middle one on it and the near one in front.
+// Then a HUD is drawn over a window texture through the replay (st_overlay): it must stand in front of the scene, whole, and leave no copy of itself where the scene moves
 #include "../nvn/nvn_mtl.m"
 #include "../../host/immersive_mac.h"
 void *front_metal_layer(void) { return NULL; }
@@ -32,18 +33,19 @@ static uint64_t frame(id<MTLTexture> color, id<MTLTexture> depth, int n, int fun
     pd.colorAttachments[0].texture = nil; pd.depthAttachment.texture = decoy ?: depth; st_pass(pd); for (int i = 0; i < 4 * n; i++) st_draw();   // a shadow map's pass: no colour, never the scene
     res_commit();
     uint64_t seq0 = g_st_pub.seq;
-    g_st_tag = st_take_depth(); uint64_t tag = g_st_tag;
+    tex_t none = {0}; g_st_tag = st_take_depth(&none); uint64_t tag = g_st_tag;
     st_present(color, NULL);
     for (int i = 0; i < 400 && g_st_pub.seq == seq0; i++) usleep(5000);
     CHECK(g_st_pub.seq != seq0, "a present's picture is published within 2 s");
     return tag;
 }
-// The centre column of the brightest run of one channel in a row of an eye's picture
-static double column(const uint8_t *px, int eye, int row, int ch) {
+// The centre column of one channel's brightness in columns x0..x1 of a row of an eye's picture
+static double column_in(const uint8_t *px, int eye, int row, int ch, int x0, int x1) {
     const uint8_t *r = px + ((size_t)eye * H + (size_t)row) * W * 4; double sum = 0, n = 0;
-    for (int x = 0; x < W; x++) { double v = r[x * 4 + ch]; sum += v * x; n += v; }
+    for (int x = x0; x < x1; x++) { double v = r[x * 4 + ch]; sum += v * x; n += v; }
     return n > 0 ? sum / n : -1;
 }
+static double column(const uint8_t *px, int eye, int row, int ch) { return column_in(px, eye, row, ch, 0, W); }
 int main(void) { @autoreleasepool {
     mtl_init(); g_tq = [g_dev newCommandQueue];
     mtl_stereo_enable(1);
@@ -93,6 +95,46 @@ int main(void) { @autoreleasepool {
     NSUInteger w, h; id<MTLBuffer> px = dm_immersive_eyes(&f, 1, &w, &h);
     if (px) { const uint8_t *p = px.contents; double l = column(p, 0, 90, 2), r = column(p, 1, 90, 2); CHECK(fabs(l - 200) < 0.6 && fabs(r - 200) < 0.6, "and both eyes get the same picture (%.2f, %.2f)", l, r); }
     mtl_stereo_release(&f);
+    // A HUD: the scene composited into a window texture by one draw, then a white bar drawn over its far band by a second, without the depth test
+    {
+        tex_t wt = {.magic = MAGIC('T', 'E', 'X', 0), .serial = 99701};
+        wt.d = (nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8, .width = W, .height = H, .depth = 1, .levels = 1, .samples = 1};
+        MTLTextureDescriptor *td = tex_desc(&wt, 0); td.usage |= MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+        id<MTLTexture> win = [g_dev newTextureWithDescriptor:td];
+        res_add(win); mtl_tex_init(&wt); serial_put(wt.serial, win); mtl_xv_window_tex(wt.serial);
+        fill(win, c, 4);
+        uint8_t bar[16 * 100 * 4]; memset(bar, 255, sizeof bar);
+        id<MTLBuffer> bb = [g_dev newBufferWithBytes:bar length:sizeof bar options:MTLResourceStorageModeShared]; res_add(bb); res_commit();
+        state_reset(); memset(&R, 0, sizeof R); mtl_sub_begin();
+        R.has_rt = 1; R.rt.n = 1; R.rt.color[0] = &wt; S.ds.dt = 0;
+        st_overlay(1);   // the composite: the picture is laid down
+        st_overlay(1);   // the HUD's first draw: the window texture is copied before it
+        enc_b_copy_buffer_texture(blit_open(), bb, 0, 16 * 4, sizeof bar, MTLSizeMake(16, 100, 1), win, 0, 0, MTLOriginMake(600, 40, 0));   // the bar, at columns 600..615 of the far band
+        st_overlay(1);   // its second draw: copied once
+        mtl_sub_commit(); mtl_drain();
+        MTL4RenderPassDescriptor *pd = [MTL4RenderPassDescriptor new]; pd.colorAttachments[0].texture = color; pd.depthAttachment.texture = depth;
+        S.ds.dt = S.ds.dw = 1; S.ds.df = NVN_DEPTH_FUNC_LEQUAL; S.has_vp = 1; S.vp[0][0] = S.vp[0][1] = 0; S.vp[0][2] = W; S.vp[0][3] = H;
+        st_pass(pd); for (int i = 0; i < 40; i++) st_draw();
+        res_commit();
+        uint64_t seq0 = g_st_pub.seq;
+        g_st_tag = st_take_depth(&wt); CHECK(g_st_tag != 0, "HUD: the frame's depth is copied");
+        st_present(win, NULL);
+        for (int i = 0; i < 400 && g_st_pub.seq == seq0; i++) usleep(5000);
+        CHECK(mtl_stereo_acquire(&f) && f.base && f.depth, "HUD: the frame comes with the picture before its overlays");
+        if (f.base) {
+            NSUInteger w2, h2; id<MTLBuffer> px2 = dm_immersive_eyes(&f, 1, &w2, &h2);
+            CHECK(px2 != nil, "HUD: both eyes are drawn");
+            if (px2) {
+                const uint8_t *q = px2.contents; double far = 0.012 * W, lo = far / 2;
+                double hl = column_in(q, 0, 90, 1, 560, 660), hr = column_in(q, 1, 90, 1, 560, 660), fl = column_in(q, 0, 90, 2, 150, 250), fr = column_in(q, 1, 90, 2, 150, 250);
+                CHECK(fabs(hl - (607.5 + lo / 2)) < 1.5 && fabs(hr - (607.5 - lo / 2)) < 1.5, "HUD: the bar stands in front of the scene (left %.2f, right %.2f, want %.2f and %.2f)", hl, hr, 607.5 + lo / 2, 607.5 - lo / 2);
+                CHECK(fabs(fl - (200 - far / 2)) < 1.5 && fabs(fr - (200 + far / 2)) < 1.5, "HUD: the far marker beside it keeps its depth (left %.2f, right %.2f)", fl, fr);
+                int ghost = 0; for (int x = 590; x < 600; x++) ghost |= q[((size_t)0 * H + 90) * W * 4 + (size_t)x * 4 + 1] > 8;
+                CHECK(!ghost, "HUD: no copy of the bar where the far band moves (left eye, columns 590..599)");
+            }
+            mtl_stereo_release(&f);
+        }
+    }
     mtl_drain();
     CHECK(!mtl_last_commit_error(), "no GPU error");
     printf("t_stereo: %d checks, %d failed\n", checks, failed);
