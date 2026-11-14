@@ -166,7 +166,7 @@ static void alias_index(const alias_key *k, int add) {
 }
 static nvn_hmap g_alias_seen = {.klen = sizeof(alias_key)};   // key → the submission of its last lookup or creation (own_hook_submission; alias_take_over spares entries looked up lately)
 static CFMutableSetRef g_alias_set;                           // the textures in the sharing table (non-owning; "is this shared")
-static uint64_t g_alias_evicted, g_alias_taken;               // shared textures evicted on pool Finalize / when another texture took over their storage, in total (the memory report)
+static uint64_t g_alias_evicted, g_alias_taken, g_alias_looks;               // shared textures evicted on pool Finalize / when another texture took over their storage, in total (the memory report)
 int own_shared_locked(id o) { return g_alias_set && o && CFSetContainsValue(g_alias_set, (__bridge const void *)o); }
 int own_keeps_locked(id o) { return tex_object_pinned(o) || own_shared_locked(o); }
 static void obj_drop(id o) { own_hook_drop(o, own_keeps_locked(o)); }   // caller holds g_smu
@@ -231,9 +231,13 @@ static uint32_t alias_take_over(const alias_key *nk, uint64_t now) {
         uint64_t ck[2] = {nk->pool, (uint64_t)c}; const alias_cell *v = nvn_hm_get(&g_alias_cells, ck);
         for (uint32_t i = 0; v && i < v->n && n < 16; i++) {
             const alias_key *k = &v->e[i].k;
-            if (!memcmp(k, nk, sizeof *k) || k->off >= hi || v->e[i].end <= lo) continue;
-            uint32_t j = 0; while (j < n && memcmp(&ks[j], k, sizeof *k)) j++;
-            if (j < n) continue;   // met in an earlier cell
+            if (k->off >= hi || v->e[i].end <= lo) continue;
+            // An entry is indexed in every cell its storage reaches, so it is met in each cell of the overlap: it is looked at in the first one alone. Looked at in each, an entry
+            // spared (looked up lately, or held) cost a key compare and two hash lookups per 64 KB cell: a 16 MB render target made again over storage that others share
+            // repeated that hundreds of times per new texture (Ocarina of Time, iPhone 17 and Mac: alias_take_over 6% of the submit thread's busy time)
+            if (c != (k->off > lo ? k->off : lo) >> ALIAS_CELL) continue;
+            if (!memcmp(k, nk, sizeof *k)) continue;
+            g_alias_looks++;
             void *val = nvn_hm_get(&g_alias, k); if (!val) continue;
             uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, k);
             if ((seen && now - seen < ALIAS_IDLE) || serial_table_holds(val)) continue;
@@ -255,7 +259,7 @@ void own_alias_at_locked(const void *pool, int64_t off, void (^fn)(const alias_k
 void own_alias_each_locked(void (^fn)(const alias_key *k, id o)) {
     for (uint32_t i = 0; i < g_alias.cap; i++) if (g_alias.vals[i]) fn((const alias_key *)(const void *)(g_alias.keys + (size_t)i * g_alias.klen), (__bridge id)g_alias.vals[i]);
 }
-own_alias_stats own_alias_stats_locked(void) { return (own_alias_stats){.n = g_alias.n, .cap = g_alias.cap, .cells = g_alias_cells.n, .evicted = g_alias_evicted, .taken = g_alias_taken}; }
+own_alias_stats own_alias_stats_locked(void) { return (own_alias_stats){.n = g_alias.n, .cap = g_alias.cap, .cells = g_alias_cells.n, .evicted = g_alias_evicted, .taken = g_alias_taken, .looks = g_alias_looks}; }
 
 const void *own_live_ref_locked(uint64_t k) { return nvn_hm_get(&g_by_serial, &k); }
 const void *own_live_ref(uint64_t k) { pthread_mutex_lock(&g_smu); const void *o = nvn_hm_get(&g_by_serial, &k); pthread_mutex_unlock(&g_smu); return o; }
@@ -493,20 +497,36 @@ own_dead_stats own_alias_dead_locked(uint32_t now, uint32_t idle, own_use_fn use
 // A submitted descriptor and a queue binding hold the compiled program by its immutable initialization serial. Retaining it must not mint serial aliases:
 // alias churn invalidates texture tables and changes composite-program keys
 typedef struct { unsigned refs, retired; } prog_pin;
-static nvn_hmap g_prog_pins = {.klen = 8};   // protected by the submission lock
+// The pins have a lock of their own (g_pin_mu), taken before g_smu where both are held (serial_del, own_live_ref take g_smu), so a submission can pin a program its replay has
+// already resolved without the submission lock (own_prog_pin_live, nvn_queue.inc nq_snapshot_object): the game's thread then copies its command lists while the queue
+// replay thread translates the last ones, instead of waiting for it (OoT-30 C-4)
+static nvn_hmap g_prog_pins = {.klen = 8};   // under g_pin_mu
+static pthread_mutex_t g_pin_mu = PTHREAD_MUTEX_INITIALIZER;
 void mtl_prog_release(prog_t *p) {
     if (!p->serial) return;
+    pthread_mutex_lock(&g_pin_mu);
     prog_pin *pin = nvn_hm_get(&g_prog_pins, &p->serial);
     if (pin) pin->retired = 1; else serial_del(p->serial);
+    pthread_mutex_unlock(&g_pin_mu);
 }
 void mtl_prog_unpin(prog_t *p) {
+    pthread_mutex_lock(&g_pin_mu);
     prog_pin *pin = nvn_hm_get(&g_prog_pins, &p->serial);
     if (pin && !--pin->refs) { nvn_hm_del(&g_prog_pins, &p->serial); if (pin->retired) serial_del(p->serial); free(pin); }
+    pthread_mutex_unlock(&g_pin_mu);
 }
-void own_prog_pin(uint64_t serial) {
+static void prog_pin_locked(uint64_t serial) {
     prog_pin *pin = nvn_hm_get(&g_prog_pins, &serial);
     if (!pin) { pin = calloc(1, sizeof *pin); if (!pin) ODIE("program retention allocation failed"); nvn_hm_put(&g_prog_pins, &serial, pin); }
     pin->refs++;
+}
+void own_prog_pin(uint64_t serial) { pthread_mutex_lock(&g_pin_mu); prog_pin_locked(serial); pthread_mutex_unlock(&g_pin_mu); }
+// Pins the program of serial when the serial table holds its compiled program (a replay resolved it), in one hold of the pin lock, so no release deletes it in between; 0: not resolved yet
+int own_prog_pin_live(uint64_t serial) {
+    pthread_mutex_lock(&g_pin_mu);
+    int live = own_live_ref(serial) != NULL; if (live) prog_pin_locked(serial);
+    pthread_mutex_unlock(&g_pin_mu);
+    return live;
 }
 
 uint32_t own_alias_unref_locked(void) {

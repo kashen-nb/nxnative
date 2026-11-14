@@ -105,7 +105,7 @@ own_dead_stats own_alias_dead_locked(uint32_t now, uint32_t idle, own_use_fn use
 uint32_t own_alias_drop_pool_locked(const void *pool);        // a pool's Finalize: its entries go (retired, own_hook_drop; a new epoch). → how many
 void own_alias_at_locked(const void *pool, int64_t off, void (^fn)(const alias_key *k, id o));   // the entries that start at off in the pool (its cell of the index)
 void own_alias_each_locked(void (^fn)(const alias_key *k, id o));
-typedef struct { uint32_t n, cap, cells; uint64_t evicted, taken; } own_alias_stats;   // entries, capacity, index cells, evicted with pools / on takeover in total
+typedef struct { uint32_t n, cap, cells; uint64_t evicted, taken, looks; } own_alias_stats;   // entries, capacity, index cells, evicted with pools / on takeover in total, entries takeovers looked at
 own_alias_stats own_alias_stats_locked(void);
 uint32_t own_alias_unref_locked(void);                        // entries no live or ghost entry resolves to (a walk: the memory report)
 
@@ -125,8 +125,9 @@ int own_tex_live_locked(uint64_t serial);
 int own_tex_live(uint64_t serial);
 int own_tex_end_locked(tex_t *t);   // a finalize: -1 when t is a copy and the object the texture was initialized in still holds it (nothing ends), else whether it was live (it is not now)
 
-// Program pins (the caller holds the submission lock); mtl_prog_release and mtl_prog_unpin (nvn_obj.h) are the other two
+// Program pins (their own lock; mtl_prog_release and mtl_prog_unpin, nvn_obj.h, are the other two). own_prog_pin_live pins only a program the serial table holds (0: none)
 void own_prog_pin(uint64_t serial);
+int own_prog_pin_live(uint64_t serial);
 
 // The change generation. g_ser_gen is read directly (an atomic load on the hot paths); only the owner's functions change it
 enum { SER_NOTES = 64,     // notes kept between two takes
