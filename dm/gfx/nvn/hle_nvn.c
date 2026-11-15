@@ -7,7 +7,7 @@
 // Metal command buffer (nvn_mtl.m): buffer copies / uniform updates go through blit (GPU ordering), event value writes / counters are written after the GPU completes;
 // sync object = submit fence value, and waits are released only after the GPU completes.
 // Every implementation gets a compile-time signature check against the prototypes in nvn_protos.h (NVNboolean parameters are received as uint32_t, only the low 8 bits are looked at).
-// Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation.
+// Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only; DM_NVN_TSV_DEFER=1 buffers up to 32 MiB until suspend/quit); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation.
 #include "../../host/hle.h"
 #include "nvn_protos.h"
 #include "nvn_count.h"
@@ -18,6 +18,7 @@
 #include "nvn_fstep.h"
 #include "nvn_rt.h"
 #include "nvn_timestamp.h"
+#include "nvn_tsv_stream.h"
 #include "../../host/front.h"
 #include "nvn_dirty.h"
 #include <mach/mach_time.h>
@@ -746,7 +747,9 @@ NVN(nvnSamplerInitialize, NVNboolean, NVNsampler *s, const NVNsamplerBuilder *b)
 NVN(nvnSamplerFinalize, void, NVNsampler *s) { ((samp_t *)s)->magic = 0; }
 
 // ---------- Programs ----------
+#include "nvn_bind_diagnostics.inc"
 NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
+    bind_diagnostics_init();
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
 NVN(nvnProgramFinalize, void, NVNprogram *p) {
@@ -1472,7 +1475,9 @@ NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, 
 }
 NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
 NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
-    *REC(c, OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){(const prog_t *)p, stages};
+    p_bind_program *packet=REC(c, OP_BIND_PROGRAM, p_bind_program);
+    *packet=(p_bind_program){(const prog_t *)p, stages};
+    bind_diagnostics_record(c,packet);
 }
 static void bind_state(NVNcommandBuffer *c, int kind, const void *st, size_t n) {
     if (g_rec_compact && (unsigned)kind < 8 && n == 4) { uint32_t v; memcpy(&v, st, 4); if (v < (1u << 21)) { crec(c, OPC_STATE, (uint32_t)kind | v << 3, 0); return; } }
@@ -1518,7 +1523,9 @@ static int rec_ubo(NVNcommandBuffer *c, int st, int first, int n, const NVNbuffe
 }
 NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) { st = st_host(st);
     if (!slots_bound("BindUniformBuffer", st, i, 1, 16)) return;
-    NVNbufferRange r = {a, n}; if (rec_ubo(c, st, i, 1, &r)) return;
+    // Engines re-record a single uniform binding in an existing command block.
+    // Its byte span must not change with address alignment or buffer range: a
+    // shorter record leaves the old block tail at the wrong command boundary.
     if (n <= UINT32_MAX) {
         *REC(c, OP_BIND_UBO_SMALL, p_bind_ubo_small) = (p_bind_ubo_small){(uint16_t)st, (uint16_t)i, (uint32_t)n, a}; return;
     }
@@ -1777,16 +1784,17 @@ void dm_gfx_enter(void) { gfx_enter(); }   // the same gate for the Vulkan layer
 void dm_gfx_leave(void) { gfx_leave(); }
 __attribute__((weak)) void dm_vk_drain(void) {}   // dm/gfx/vk/hle_vk.m: wait for the Vulkan layer's queue (the graphics unit tests do not link it)
 __attribute__((weak)) void dm_gl_drain(void) {}   // dm/gfx/gl/hle_gl.m: the same for the GL layer
+static void dump_tsv_drain(void);
 void dm_gfx_suspend(int on) {
     pthread_mutex_lock(&g_susp_mu);
     g_susp = on != 0;
     if (on) while (g_inflight_api) pthread_cond_wait(&g_susp_cv, &g_susp_mu);
     else pthread_cond_broadcast(&g_susp_cv);
     pthread_mutex_unlock(&g_susp_mu);
-    if (on) { dm_vk_drain(); dm_gl_drain(); mtl_drain(); mtl_arch_save(0, 0); LOG("[nvn] graphics suspended: in-flight GPU work drained"); } else LOG("[nvn] graphics resumed");   // the Vulkan and GL queues first: presents on the NVN queue wait for their frames;
+    if (on) { dm_vk_drain(); dm_gl_drain(); mtl_drain(); dump_tsv_drain(); mtl_arch_save(0, 0); LOG("[nvn] graphics suspended: in-flight GPU work drained"); } else LOG("[nvn] graphics resumed");   // the Vulkan and GL queues first: presents on the NVN queue wait for their frames;
     // the pipeline archive starts writing what it holds: a process in the background may be ended without a word (iOS), and a prewarm's captures wait for a full period
 }
-void dm_gfx_quit(int wait_ms) { mtl_arch_save(wait_ms, 1); }
+void dm_gfx_quit(int wait_ms) { dump_tsv_drain(); mtl_arch_save(wait_ms, 1); }
 void dm_gfx_quit_begin(void) { mtl_warm_stop(); mtl_arch_save(0, 0); }   // the end's first step: no more prewarm compiles, and what the archive holds starts writing beside the drain (which can wait on a draw that compiles)
 _Static_assert(DM_QUIT_ARCH_MS == MTL_QUIT_ARCH_MS, "a graceful exit gives the pipeline archive the time a quit does");
 // One submission at a time: the Metal replay keeps one command buffer and one upload batch for the submission in progress (nvn_mtl.m g_cb). Fire Emblem: Three Houses initializes two queues and
@@ -1962,6 +1970,10 @@ NVN(nvnQueueAcquireTexture, NVNqueueAcquireTextureResult, NVNqueue *q, NVNwindow
 // Frame boundary: on each present, print / write to disk the call count of each NVN function for this frame
 static uint64_t g_prev[NVN_NFUNC];
 static FILE *g_tsv;
+static nvn_tsv_stream g_tsv_stream = NVN_TSV_STREAM_INIT;
+static void dump_tsv_drain(void) {
+    if (nvn_tsv_stream_drain(&g_tsv_stream)) LOG("[RED] could not flush NVN timing TSV");
+}
 static void dump_frame(void) {
     static int inited, nframes = 3, calls = 1;
     if (!inited) {
@@ -1969,7 +1981,15 @@ static void dump_frame(void) {
         const char *e = getenv("DM_NVN_FRAMES"); if (e) nframes = atoi(e);
         const char *c = getenv("DM_NVN_TSV_CALLS"); if (c) calls = atoi(c);   // 0 = write only the @ timing rows (pulling files from a real device has a size limit, and the call-count rows take about 2/3)
         const char *t = getenv("DM_NVN_TSV"); if (t && !(g_tsv = fopen(t, "w"))) LOG("[RED] cannot open %s", t);
-        if (g_tsv) fprintf(g_tsv, "# kind: nvn-per-frame  value = call count when name is an NVN function name; names starting with @ are timing probes (ms / count)\nframe\tname\tvalue\n");
+        if (g_tsv) {
+            const char *defer = getenv("DM_NVN_TSV_DEFER");
+            size_t capacity = defer && atoi(defer) ? 32u * 1024u * 1024u : 0;
+            if (nvn_tsv_stream_init(&g_tsv_stream, g_tsv, capacity)) {
+                LOG("[RED] cannot allocate deferred NVN timing TSV; capture disabled");
+                fclose(g_tsv); g_tsv = NULL;
+            } else atexit(dump_tsv_drain);
+        }
+        if (g_tsv) nvn_tsv_stream_printf(&g_tsv_stream, "# kind: nvn-per-frame  value = call count when name is an NVN function name; names starting with @ are timing probes (ms / count)\nframe\tname\tvalue\n");
     }
     uint64_t total = 0; unsigned nfn = 0;
     char line[8192]; size_t o = 0; line[0] = 0;
@@ -1979,10 +1999,10 @@ static void dump_frame(void) {
         g_prev[i] = c;
         if (!d) continue;
         total += d; nfn++;
-        if (g_tsv && calls) fprintf(g_tsv, "%llu\t%s\t%llu\n", g_frame, nvn_names[i], d);
+        if (g_tsv && calls) nvn_tsv_stream_printf(&g_tsv_stream, "%llu\t%s\t%llu\n", g_frame, nvn_names[i], d);
         if (g_frame <= (uint64_t)nframes && o < sizeof line - 96) o += snprintf(line + o, sizeof line - o, " %s=%llu", nvn_names[i] + 3, d);
     }
-    if (g_tsv) fflush(g_tsv);
+    if (g_tsv && !g_tsv_stream.bytes) fflush(g_tsv);
     if (g_frame <= (uint64_t)nframes) LOG("[nvn] %s %llu: %u functions %llu calls |%s", g_frame ? "frame" : "init", g_frame, nfn, total, line);
     else if (g_frame % 300 == 0) LOG("[nvn] frame %llu: %u functions %llu calls", g_frame, nfn, total);
     g_frame++; cs_dump();
@@ -2152,7 +2172,7 @@ static int g_slow = -1;
 static int slow_on(void) { if (g_slow < 0) g_slow = getenv("DM_SLOWFRAME") != NULL; return g_slow; }
 static int frame_rec(void) { return g_tsv || slow_on(); }
 static void trow(uint64_t f, const char *name, double v) {
-    if (g_tsv) fprintf(g_tsv, "%llu\t%s\t%.3f\n", f, name, v);
+    if (g_tsv) nvn_tsv_stream_printf(&g_tsv_stream, "%llu\t%s\t%.3f\n", f, name, v);
     if (slow_on()) { __typeof__(g_sr[0]) *r = &g_sr[f % SRN]; if (r->f != f) { r->f = f; r->n = 0; } if (r->n < 64) { r->k[r->n] = name; r->v[r->n++] = v; } }
 }
 static double srow(uint64_t f, const char *name, double dflt) {
@@ -2323,6 +2343,7 @@ static int g_engine_stub = 1;   // the weak dm_fps_lock_engine's answer, for gra
 __attribute__((weak)) int dm_fps_lock_engine(void) { return g_engine_stub; }   // hle_fpslock.c: the host writes fps_target into an engine limiter of this main
 __attribute__((weak)) void dm_ue_cvar_tick(void) {}   // hle_uecvar.c: Unreal's texture streaming pool (profile ue_texture_pool)
 __attribute__((weak)) int dm_movie_hz(void) { return 0; }   // hle_movie.c: the picture rate of the movie playing, 0 when none; graphics unit tests have no movie decoder
+__attribute__((weak)) int dm_codec_video_native_fps(void) { return 0; }
 // Thermal cap (iOS): while the device is thermally serious or worse (NSProcessInfo thermalState >= 2) the frame step holds 30 fps, and it goes back to the cap after the device
 // has been fair or better for THERMAL_CALM_NS, so it does not flap. At "serious" iOS caps the GPU clock to about a third: Breath of the Wild's vistas (about 3,000 G-buffer draws)
 // then took 17-26 ms a frame and dropped a frame in most windows; a steady 30 instead also lets the device cool. DM_THERMAL_CAP=0 turns it off; the Mac reports no thermal state
@@ -2383,6 +2404,7 @@ static int fps_step_cap(void) {
     // calm interval, and cooling during those caps counts towards recovery.
     int thermal = thermal_capped(), movie = dm_movie_hz();
     if (movie) return movie >= 50 && !thermal ? 60 : 30;   // a movie: its player takes a picture per game frame, so the step follows its pictures whatever the target, the thermal cap aside (hle_movie.c dm_movie_hz)
+    if (!thermal && dm_codec_video_native_fps() == 60) return 60;
     return t <= 30 || thermal ? 30 : 60;
 }
 static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides the steps in whole vsyncs
@@ -2475,7 +2497,9 @@ static uint64_t present_period(const win_t *o) {
         if (want < 2 || want % 2) atomic_store(&g_itv2_since, 0);   // an odd interval needs the 60 Hz link: 3 vsyncs on a 30 Hz link were 2 ticks, 15 fps for 20
         else if (was < 2 || was % 2) atomic_store(&g_itv2_since, now_ns() | 1);   // | 1: the start is never 0
     }
-    int itv = present_itv(o), hz = g_hz;
+    // A capped frame step counts 60 Hz vsyncs (120 only in native-120 mode),
+    // independently of the screen/link refresh rate used for interpolation.
+    int itv = present_itv(o), hz = g_hz > 0 && fps_present_cap() ? fstep_hz() : g_hz;
     return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
 }
 // The period the acquire thread declares to the scheduler (rt_declare), which the frame threads follow: the present period, except that a hold the frame step raised for late frames keeps the cap's deadline.
@@ -2485,7 +2509,7 @@ static uint64_t rt_period_ns(const win_t *o, uint64_t period) {
     int c = fps_step_cap();
     if (!period || !c || !fstep_on() || (dm_fps_state && __atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED))) return period;
     int kmin = fstep_hz() / c;
-    return present_itv(o) > kmin ? (uint64_t)kmin * 1000000000ull / (uint64_t)g_hz : period;
+    return present_itv(o) > kmin ? (uint64_t)kmin * 1000000000ull / (uint64_t)fstep_hz() : period;
 }
 // Whether the CPU runs below its speed for reasons other than heat (nvn_fstep_next's slow, which allows probes): under 30% of the process's CPU time on performance cores in
 // each of the last two windows of 30 presents, on a system with two core types, at thermal state nominal or fair, Low Power Mode off. A game that waits out a long hold is parked

@@ -777,6 +777,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:** [DRAGON QUEST XI S](../../dm/games/01006C300E9F0000/README.md) 1.0.4 on an iPad mini 7 (A17 Pro), which presents three times before its first submission ([GitHub issue #626](https://github.com/seedds/nxnative/issues/626)). The reporter's Apple M4 test did not fault without the fix.
 - **Not checked:** the iPad with the fix.
 
+### Future interpolation blocks an older ready display
+
+- **Symptom:** the experimental asynchronous interpolation backend delays a native snapshot that is already ready while an unrelated future interpolation waits for its producer.
+- **Cause:** generation and snapshot display shared one ordered Metal command queue. An event wait for the future input held every later command buffer, including an older native display without that dependency. A gated M4 Pro probe reproduced the block; it does not establish how much of a real-game frame-rate regression this causes.
+- **Fix:** keep separate generation and display queues and completion timelines. Native display waits only for its input copy; generated display also waits for its own generated result. Before overwriting a snapshot slot, the producer waits for both its last generation/history reader and its last display reader, captured before submitting the new generation. Never use the latest history-reader epoch as the generated-result-ready epoch: it can depend on a future producer.
+- **Check:** the snapshot GPU test gates future generation and verifies that an older native display completes, that a generated display waits for its own result, and that slot reuse waits for readers on both timelines. Run make -C dm/gfx/tests GAME=<id> check_t_temporal_snapshot.
+- **Found on:** the development-only DM_OOT_FRAMEGEN_ASYNC=1 backend for [Ocarina of Time](../../dm/games/0400486024DEC000/README.md), M4 Pro. The corrected queue dependencies pass the GPU checks; a 45-second camera route still produces about 30 native updates/s. The performance regression against the serial prototype remains open.
+
 ### A GPU whose access macOS revoked stops the game
 
 - **Symptom:** after a GPU hang or GPU page faults, every upload, segment, submission and display command buffer comes back `kIOGPUCommandBufferCallbackErrorSubmissionsIgnored` ("Ignored (for causing prior/excessive GPU errors)"). Nothing is drawn again while the game's sound and logic go on, until the game aborts itself (`game called nn::diag abort`, about 70 s later); in full screen, WindowServer froze for 40 s and its watchdog killed it. With the fix the log has `[RED] GPU access revoked: the … command buffer was ignored`, and a Mac app shows an alert and quits.
@@ -1626,6 +1634,15 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** `gp_begin` records the encoder it stamped, and `gp_end` ignores any other encoder, so the open pass keeps its label until its own end.
 - **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) with `DM_NVN_GPUPROF=every:300` on the Mac (issue #531; one run in four, about frame 23,000). `t_gpuprof` ends an upload encoder inside a profiled pass; it runs in CPU CI. Not rerun in the game.
 
+- **Shader identities:** sampled render encoders also report up to eight distinct fragment keys and their draw counts in [gpuprof-shader] lines; further identities are counted explicitly as other draws. Multi-draw fast paths inherit the preceding draw's shader. This associates shader keys with a timed pass without verbose pass dumps, whose logging can delay CPU submission. Identity counts are not per-shader GPU timings. t_gpuprof checks attribution, encoder ownership and bounded overflow.
+
+### Bounded rendering interval traces
+
+- **Symptom:** per-frame diagnostic output can perturb the timing being investigated, and a truncated trace can look complete.
+- **Cause:** filesystem work and overlapping CPU/GPU intervals are different from actual shader execution; bounded buffers can overflow and killed processes cannot flush.
+- **Fix:** `DM_NVN_FLOW=/path/to/flow.tsv` records native, snapshot/interpolation and presentation command-buffer intervals, plus registration and actual queue-submission times. With `DM_NVN_WAITS=1` it also records named CPU waits (excluding individual poll attempts), alongside presentation-queue, allocator and display-tick waits. Records stay in a bounded memory buffer and are written by the graphics shutdown hook after the GPU drain (the host uses _exit, which bypasses atexit); a killed process has no complete trace. DM_NVN_FLOW_FROM/TO select a window in seconds since host start; crossing intervals are retained. Check the overflow count before analysis. GPU command-buffer intervals include internal stalls: their union is scheduled coverage, not a hardware utilization counter. CPU waits on different threads or nested calls may overlap. `DM_FRAMEGEN_TIMES` explicitly records physical presentation callbacks even when interpolation is off.
+- **Found on:** OOT timing investigations; synthetic `t_flow_trace` and `t_tsv_stream` checks exercise bounded recording and overflow. This is measurement infrastructure, not a gameplay speedup.
+
 ### An argument block reused after another shader of its stage encoded
 
 - **Symptom:** none seen in a game. A draw could bind a texture, sampler, storage or uniform buffer from before a binding change: the draw's shader had written its block earlier in the pass, another shader wrote a block on the same stage after the change, and the first shader drew again. [PR #2249](https://github.com/seedds/nxnative/pull/2249) found the mechanism by reading ([#1898](https://github.com/seedds/nxnative/pull/1898)'s 56e7ee16).
@@ -1634,6 +1651,8 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Found on:** reading; no game failure reported. `t_args_gen` runs the sequence (a binding change, another shader's encode, the first shader again), shaders taking turns, a uniform-only change, and the ring slot; without the `bind_stages` change its slot checks fail.
 
 ## Conditional rendering and queries
+
+
 
 ### Conditional rendering evaluated at replay
 
@@ -2030,7 +2049,7 @@ Digimon Story Cyber Sleuth: Complete Edition (Media.Vision's MVGL engine, SDK 6.
 
 - **Symptom:** read-only depth/stencil attachments are written back after every pass, and the periodic unwritten-store savings counter remains zero with the default configuration.
 - **Cause:** `udc_note_draw` and `sd_finish` returned early when `DM_NVN_TBDR` was off. This also disabled the local unwritten-attachment proof, although it does not depend on future sampled-texture readers. The broader lookahead remains disabled because it does not understand bindless readers.
-- **Fix:** collect per-pass write facts independently of the lookahead switch and omit only stores of attachments that were loaded and provably unchanged. Clears, depth writes, stencil writes and possible writable image/atomic/storage aliases conservatively retain stores, except for the mandatory [image-only color-attachment rule](#image-stores-into-an-attachment-of-their-own-pass). Lookahead, pass merging and cross-submission invalidation remain disabled. `DM_NVN_UNWRITTEN_DC=0` disables optional unwritten-store savings; the image-write preservation rule stays active.
+- **Fix:** collect per-pass write facts independently of the lookahead switch and omit only stores of attachments that were loaded and provably unchanged. Color-tile writes require both an enabled channel and a fragment output, translated through the selected pipeline's physical-output map. The already computed draw raster mask supplies that intersection; testing the two logical masks independently both retained masked-out stores and could miss a remapped physical output. Clears, depth writes, stencil writes and possible writable image/atomic/storage aliases conservatively retain stores, except for the mandatory [image-only color-attachment rule](#image-stores-into-an-attachment-of-their-own-pass). Lookahead, pass merging and cross-submission invalidation remain disabled. `DM_NVN_UNWRITTEN_DC=0` disables optional unwritten-store savings; the image-write preservation rule stays active.
 - **Check:** `make -C dm/gfx/tests GAME=<id> check_t_unwritten_store` performs real GPU readback against a store-all control and literal color/depth/stencil values, with lookahead disabled. It covers read-only depth/stencil, depth writes, stencil writes, pending clears, and writable images (including native image atomics) and both storage-buffer binding forms. `t_unwritten_store --bench` runs a synthetic 32-pass 1080p workload with balanced on/off order; it is not a game FPS measurement.
 - **Found on:** [NieR:Automata US 1.0.3](../../dm/games/010056B015FE8000/README.md#factory-combat-capture-and-9s-texture-follow-up), during iPhone factory-combat performance investigation. The change passes the GPU proof and rendering regressions on Mac; iPhone gameplay benefit remains to be measured.
 
@@ -2049,3 +2068,94 @@ Digimon Story Cyber Sleuth: Complete Edition (Media.Vision's MVGL engine, SDK 6.
 - **Fix:** the present reports the shape of the frame it draws ([the layer's](#a-crop-only-picks-texels-the-picture-has-the-layers-shape)) whenever its width / height changes (`nvn_mtl.m` `present_now` → `front.h` `front_picture_shape`; every graphics API presents there). The iOS front end lays the game's view out in that shape (`DmLayout.h` takes it as a parameter: the overlay, the split, Fill and the TV alike), so a 1.43:1 picture fills a 1.43:1 screen in Fit and touches are normalized on the picture as drawn; the Mac maps the mouse on the picture's own rectangle. A 16:9 game reports 16:9 and keeps its layout, and a size change of the same shape (1280x720 handheld, 1920x1080 docked) is not reported.
 - **Check:** the [Duo harness](../../dm/ios/tests/duo/README.md) tests the taller picture in Fit, in Fill and on a wider screen, and the production root view following a reported shape and returning to 16:9. Not yet run on a device.
 - **Found on:** [Breath of the Wild](../../dm/games/01007EF00011E000/README.md#screen-shape-dm_screen_aspect-current) and [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md#screen-shape-dm_screen_aspect-current) with `DM_SCREEN_ASPECT=1.43`.
+
+
+### CPU texture uploads share a bounded batch
+
+- **Symptom:** streaming textures delay descriptor registration; a guest-thread hitch stack waits in `mtl_reg_tex`, while a separate host-inclusive capture finds queue replay in `pkg_upload` / `up_flush` / the Metal residency commit. These captures need not represent the same stall.
+- **Cause:** the CPU fallback flushed every texture immediately, even inside an open rendering submission. The GPU path already grouped uploads until a submission boundary or staging limit. Calling the residency commit for each CPU texture adds repeated driver work under the descriptor lock.
+- **Fix:** count shared CPU staging against the existing 128 MiB batch budget, split before exceeding it, retain upload targets through completion, and flush at the existing submission/readback/presentation boundaries. Outside a rendering submission, flush immediately. A single oversized texture remains a standalone allocation. Keep the descriptor lock: copied descriptors still point to guest pools that can be finalized concurrently.
+- **Check:** `t_upload_budget` sends twenty distinct 8 MiB linear textures through the real CPU fallback in one rendering submission. It verifies batching, the staging bound and every output byte after source replacement and budget splitting. `t_upload_slots`, `t_direct_upload` and `t_nvn` also pass; the upload tests run with deferred encoding both off and on. This establishes correctness and fewer batches, not a measured gameplay performance gain.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
+### A profile-declared square-root-color upscaler stage
+
+- **Symptom:** selecting MetalFX does not replace a newer spatial neural upscaler; its color input differs from the legacy NDSR variants.
+- **Cause:** a verified newer final stage reads RGB9E5 containing sqrt(linear) color after native antialiasing. Treating those values as linear, sRGB or HDR without decoding changes the picture. Its shader identity alone does not prove another variant shares this contract.
+- **Fix:** an explicit profile recipe and experimental launch opt-in identify the final stage, dimensions, argument indices and full dispatch grid. Two precompiled host kernels square the input into RGBA16F and convert MetalFX Linear output to the original writable RG11B10 image. The preceding AA stages remain native. A successful replacement also runs the normal post-dispatch scene observers: skipping them leaves the frame interpolator without a final scene. Unsupported format, dimensions, grid, crop, missing image or possible alias keeps the original dispatch. No runtime source compilation is added.
+- **Check:** synthetic Metal tests cover pixels, unsupported inputs, partial dispatch and cache eviction before deferred work finishes, in both encoding modes. A same-frame offline replay of the original kernel reproduces every captured output pixel before comparison with MetalFX. The composed dispatch regression fails six scene/flow assertions with the old early return and passes 61 checks in each encoding mode with the notification restored. A game trial confirms hundreds of replacements and actual generated drawable callbacks, normal exit and no RED lines; sustained timing and quality across bright scenes, foliage and text remain open. The option stays disabled by default.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
+
+### Compact host-owned interpolation surfaces
+
+- **Symptom:** an experimental native/generated pair retains a padded window canvas, then copies its visible rectangle again before final MetalFX scaling. Generated display allocation and conversion also carry padding that is never shown.
+- **Cause:** snapshots inherited the game's full backing dimensions, and the queue stored one crop for both pictures. The final spatial scaler always extracted that crop, including when a host-owned texture could already have exact content bounds.
+- **Fix:** in interpolation mode 3, copy a valid same-aspect native crop directly into its protective snapshot. Convert the generated picture into a compact surface only when the present crop exactly matches its verified final viewport and preserves the backing aspect. Otherwise retain the legacy canvas. Queue separate immutable crops for native and generated pictures. The asynchronous final spatial scaler reads a source directly only when its physical bounds exactly match the full valid input and it satisfies the scaler's usage requirements; padded sources retain the extraction. Input-content dimensions alone do not guarantee equivalent edge sampling on a larger backing.
+- **Check:** `t_present_classic_pair` verifies exact offset-crop bytes and the shape-changing fallback. `t_temporal_snapshot` exercises serial/asynchronous and direct/deferred paths, UI fidelity, resize, independent producer/generation/display readers, and a generated midpoint/HUD through the actual final spatial path. `t_present_crop` and `t_dispatch_replacement` also pass. An OOT game pass confirms compact native/generated sources and final MetalFX at 2560x1440, with no RED lines. This does not establish sustained 120 Hz or every scene's quality.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
+### Host interpolation textures declare their actual usage
+
+- **Symptom:** private world, UI, depth and display snapshots all request compute writes and arbitrary format views, even when they are only copied and read. These flags can prevent lossless GPU texture optimization.
+- **Cause:** one broad-purpose texture allocator served every interpolation surface.
+- **Fix:** allocate production snapshots with the usage reported by the actual MetalFX interpolator plus the operations the host performs. Motion retains ShaderWrite for camera reprojection; display/control remain readable render targets. Compatible linear/sRGB views do not require PixelFormatView. Preserve the broad allocator for fixtures. Do not remove flags from guest aliasing/sparse textures as part of this change. Apple's [texture optimization guidance](https://developer.apple.com/documentation/metal/optimizing-texture-data) describes eligibility, not a guaranteed compression ratio or speedup.
+- **Check:** the interpolation GPU matrix passes under Metal API validation. The real OOT pass reports world/UI/depth usage 1, output/display 5 and motion 3, and its native final-copy control matches with zero RGB LSB error. Actual compression and isolated performance gain are not measured.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
+### Camera reprojection composes transforms once per image
+
+- **Symptom:** camera-only motion reconstructs world coordinates and applies a second transform for every depth pixel, with cancellation in single-precision intermediate world positions.
+- **Cause:** the current inverse clip transform and previous clip transform were passed separately to the GPU.
+- **Fix:** compose previous-world-to-clip times current-clip-to-world once with the existing double-accumulating `nvn_cam_mul`. A separate precompiled host shader evaluates the previous x/y/w row products directly. Keep the original shader as a test control. Update preview, serial snapshot and asynchronous snapshot uniforms together; preserve depth convention, direction, scale and invalid-value handling. This does not add object motion.
+- **Check:** `t_camera_motion` executes original and composed entries for identity, signed translations, jitter and reversed-depth fixtures. The composed entry's maximum error in the last fixture is 0.000002 pixels. The interpolation/dispatch fixtures and a real game pass also succeed. A CPU screen of seven recorded depths favors the composed expression against a double reference, but is not a hardware accuracy/performance measurement on those captures. Detailed character-motion quality remains open.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
+
+### Pre-UI interpolation capture does not need a fragment pass
+
+- **Symptom:** preserving a reconstructed scene before UI draws adds a fullscreen fragment pass, a sampled texture view and copy arguments even when the retained image has identical dimensions and format.
+- **Cause:** the interpolation observer always used the format-converting render copy helper.
+- **Fix:** use the existing ordered texture-copy encoder for a single-sample 2D image whose retained format and channel mapping are identical. The destination remains a separate host-owned texture; input lifetime, pre-UI timing, snapshot readers and scene continuity are unchanged. Conversion and nonidentity channel mappings keep the existing render path. This removes a fragment pass; it does not remove the protected scene copy or its bytes.
+- **Check:** the actual spatial replacement/scene-observer fixture uses nonuniform tiled packed colors and compares every retained RG11 pixel against the real output. Both direct and deferred encoding pass 64 checks; asynchronous interpolation, camera, UI completion and slot lifetime pass 179 checks in each encoding mode under Metal validation. An isolated performance gain is not established by these correctness checks.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
+
+### Final spatial scaling can write an identity drawable directly
+
+- **Symptom:** asynchronous final MetalFX scaling writes a full-size offscreen image and immediately samples it into an identical drawable.
+- **Cause:** the final quad is retained even when it performs no crop, aspect fit, format conversion or origin flip.
+- **Fix:** opt in with `DM_PRESENT_UPSCALE_DIRECT=1`. The Mac front end makes the layer writable before acquiring its first drawable. The asynchronous scaler writes directly only for a full viewport, matching format/dimensions, upper-left origin, private destination storage and every required scaler usage. Other cases retain the private offscreen texture, using an exact full-size GPU copy when compatible, or the quad for transforms. Default presentation and texture dependencies are unchanged.
+- **Check:** on OOT's M4 Pro at3840×2160, one actual native drawable and one generated drawable match same-input scaler-plus-quad references exactly (33,177,600 bytes each, zero differences). Three ABBA cycles reduce median native GPU command-buffer envelopes by 0.30–0.50 ms; physical delivery stays near 119.6/s with occasional gaps. These overlapping envelopes are not exclusive GPU timings. The ABBA uses a writable layer in both arms and does not isolate the layer flag's cost.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md). No all-game or constant 120 Hz claim.
+
+### Spatial MetalFX output must use private storage
+
+- **Symptom:** Metal API Validation aborts with `outputTexture must have private storage mode` when spatial MetalFX encodes directly into a drawable.
+- **Cause:** a writable IOSurface-backed drawable can use managed storage. Matching dimensions, format and usage bits do not satisfy the private-storage requirement documented by `MTLFXSpatialScalerBase.outputTexture`.
+- **Fix:** permit direct output only with `MTLStorageModePrivate`. Otherwise keep the scaler's private output. Copy its pixels with a GPU blit when dimensions, format, origin and texture kinds match and both textures allow it; retain the quad for crops, flips and framebuffer-only targets. No scaling algorithm or simulation clock changes.
+- **Check:** `t_spatial_output` runs the production scaler and copy with Metal API Validation for shared, managed and private destinations. Its 27 checks compare every output pixel bit-for-bit across direct and copied paths. An M4 Pro OOT run confirms a managed drawable takes the private-output route, both native/generated MetalFX phases complete, final-copy RGB error is zero and no RED lines occur. The 60–96 s window records 2,151 sources and 2,151 real FI, 4,302 positive and zero null presentations, about 119.50/s. Five gaps exceed 15 ms, with a 75 ms maximum: this fixes an API contract violation, not all stutters or HDR. No other-game launch was performed.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
+### Explicit drawable dimensions measure output work independently of the panel
+
+- **Symptom:** a smaller Mac panel prevents measuring the workload of a higher-resolution output by resizing its game window.
+- **Cause:** the default drawable correctly follows the window's backing-pixel dimensions.
+- **Fix:** `DM_DRAWABLE_SIZE=WIDTHxHEIGHT` explicitly overrides the drawable for diagnostics, including after AppKit resize/backing notifications. Each dimension must be 1..16384; malformed values keep the default. Without the setting, the window continues to determine the drawable. A forced 16:9 output needs a matching onscreen layer: use a 16:9 window or the [picture-layer option](frame-rate.md#fullscreen-output-can-match-the-panels-native-pixels). This diagnostic alone does not change mouse mapping or the panel's mode.
+- **Check:** OOT's native and generated final scalers report 2048×1152→3840×2160 while the built-in panel remains 3024×1964. This establishes 4K render work, not 4K physical scanout.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
+
+### Native HDR through a linear EDR display layer
+
+- **Symptom:** Advertising HDR to a game while the Mac layer remains BGRA8 SDR produces washed colours. Copying PQ codes into a linear float layer is also incorrect. An HDR spatial scratch texture without its compute writer usage can instead leave the world black while the independently composed HUD remains visible.
+
+- **Cause:** The host must agree with the game's signal and Metal resource requirements at every boundary. HDR capability, transfer function, primaries, reference white, render texture usages and presentation metadata are separate contracts. Current screen EDR headroom can still equal1 before an EDR context requests it; it is not a capability test.
+
+- **Fix:** The opt-in Mac `DM_OOT_HDR=1` path chooses RGBA16Float, extended-linear sRGB and EDR before the first drawable, only when the selected screen has potential headroom above1. The game then receives HDR status. For the verified final shader pair, the renderer retains the pre-PQ linear709 composite, expressed relative to the game's203-nit paper white, and snapshots that source into the frame's own float allocation. The game's PQ target is preserved. Missing/unrecognised sources are withheld rather than displayed through an assumed transfer function. The observer runs independently of the interpolation switch.
+
+The native and interpolated snapshots remain float; MetalFX spatial scaling uses HDR processing. The internal square-decode scratch retains ShaderWrite, including in HDR mode. Every presentation ticket carries immutable content metadata; its HDR10 EDR metadata is set before acquiring a drawable, with opticalOutputScale equal to reference white. The1000-nit initial mastering target is virtual content metadata, not a screen-peak measurement. The game supplies its content peak,710nits in the observed OOT path. CoreAnimation performs display mapping. The layer's format remains fixed for its lifetime; a launch on SDR remains SDR. Moving an HDR-launched window onto SDR keeps the float contract and delegates mapping to the compositor; physical cross-display acceptance remains open.
+
+`DM_OOT_HDR_OUTPUT_ALIAS=1` additionally removes an identity copy only when the compact HDR FI output already matches the display format, dimensions and full source rectangle. Both allocations remain retained/resident for fallback and resize. Slot reuse waits for generation and display-reader events, including a reader of an old aliased output. SDR, partial crops and mismatched dimensions retain their original path. The flags default off; the source recogniser is a known-game adapter, not general PQ detection.
+
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#optional-native-hdr-transport): real Mac FI, native/UI fidelity and raw HDR captures; procedural whole-image equivalence, delayed-reader and retirement tests. No general stable120, full-game or physical-panel colour certification follows from these checks.

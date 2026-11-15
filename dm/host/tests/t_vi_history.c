@@ -2,6 +2,7 @@
 // frame the present queue handed on with a present tick (one the Mac dropped too: a Switch shows every frame it is handed), 1 for one still queued, the frame numbers of GetLatestFrameNumber. Unreal's RHI takes the
 // first status-2 entry as its latest flip (Minecraft Dungeons II main+0x142b0b0), so the newest shown frame has to come first
 #include "../../gfx/hle_vi.c"
+int front_hdr_enabled(void) { return 0; }   // No AppKit front end in this standalone history fixture.
 #include <assert.h>
 
 static uint64_t g_count, g_in, g_done, g_gns = 5000000000ull, g_hns = 9000000000ull;

@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <mach/mach.h>
+#include <mach/thread_switch.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
@@ -534,6 +535,33 @@ static void *hitch_main(void *arg) {
         int nt = 0;
         pthread_mutex_lock(&G); for (thr_t *t = g_all; t && nt < 256; t = t->all) if (t->started && !t->exited) hitch_grab(t, &hs[nt++]); pthread_mutex_unlock(&G);
         for (int k = 0; k < nt; k++) hitch_log(&hs[k]);
+        // Opt-in: registry / Metal locks may be owned by a host encoder rather
+        // than a guest. Capture those stacks too, without external symbol scans.
+        const char *host_dump = getenv("DM_HITCH_HOST");
+        if (host_dump && atoi(host_dump)) {
+            thread_act_array_t ports = NULL; mach_msg_type_number_t count = 0;
+            if (task_threads(mach_task_self(), &ports, &count) == KERN_SUCCESS) {
+                mach_port_t self = pthread_mach_thread_np(pthread_self());
+                for (mach_msg_type_number_t j = 0; j < count; j++) {
+                    int guest = 0; hitch_t h; char name[48] = "host";
+                    pthread_mutex_lock(&G);
+                    for (thr_t *t = g_all; t; t = t->all) if (t->mport == ports[j]) { guest = 1; break; }
+                    if (!guest && ports[j] != self) {
+                        thr_t native = {0}; native.mport = ports[j];
+                        hitch_grab(&native, &h);
+                    }
+                    pthread_mutex_unlock(&G);
+                    if (!guest && ports[j] != self) {
+                        pthread_t pt = pthread_from_mach_thread_np(ports[j]);
+                        if (pt) pthread_getname_np(pt, name, sizeof name);
+                        snprintf(h.name, sizeof h.name, "%s", name[0] ? name : "host");
+                        hitch_log(&h);
+                    }
+                    mach_port_deallocate(mach_task_self(), ports[j]);
+                }
+                vm_deallocate(mach_task_self(), (vm_address_t)ports, count * sizeof *ports);
+            }
+        }
     }
     return NULL;
 }
@@ -810,12 +838,25 @@ static uint64_t yield_backoff_ns(uint64_t run_ns, int clock) {
     return s < (uint64_t)g_bo_cap ? s : (uint64_t)g_bo_cap;
 }
 static void sleep_precise(uint64_t dl);
+// Darwin sched_yield uses a priority-depressing yield: on an M4 Pro under load
+// its short poll cost 10 ms. Horizon's yield does not lower a worker's priority
+// for a whole host quantum. Relinquish the CPU without depression; existing
+// progress detection and bounded back-off still keep idle polling from spinning.
+// Diagnostic DM_YIELD_NODEPRESS=0 restores Darwin sched_yield. The measured
+// non-depressing default stays on; concurrent first calls publish the same mode.
+static void host_yield(void) {
+    static _Atomic int mode;   // 0 unknown,1 non-depressing,2 original sched_yield
+    int m = atomic_load_explicit(&mode, memory_order_relaxed);
+    if (!m) { const char *e = getenv("DM_YIELD_NODEPRESS"); m = e && !strcmp(e, "0") ? 2 : 1; atomic_store_explicit(&mode, m, memory_order_relaxed); }
+    if (m == 2) sched_yield(); else (void)thread_switch(MACH_PORT_NULL, SWITCH_OPTION_NONE, 0);
+}
+
 // One back-off sleep of bo ns, counted for the power line
 static void backoff_sleep(thr_t *me, uint64_t bo) { me->nbackoff++; me->sleeping = 1; struct timespec ts = {0, (long)bo}; nanosleep(&ts, 0); me->sleeping = 0; }
-// sched_yield, or a short sleep once the wait has lasted run_ns past the back-off's start
+// A non-depressing host yield, or a short sleep once back-off starts
 static void yield_for(thr_t *me, uint64_t run_ns, int clock) {
     uint64_t bo = yield_backoff_ns(run_ns, clock);
-    if (bo) backoff_sleep(me, bo); else sched_yield();
+    if (bo) backoff_sleep(me, bo); else host_yield();
 }
 // One yield SVC of the calling thread (me may be NULL); regs = the guest registers at the SVC.
 // A run of yields is a wait only while the loop makes no progress: it also starts again when the caller's callee-saved registers x19–x28 differ from the last yield's. The SDK's
@@ -832,7 +873,7 @@ static void yield_for(thr_t *me, uint64_t run_ns, int clock) {
 // A wait whose pass reads the system clock (dm_clock_reads moved since the last yield of the run) waits for a time, not for another thread's handoff: a clock wait (clock_wait).
 static void clock_wait(thr_t *me, uint64_t sig, uint64_t now, int predict);
 static void thr_yield(thr_t *me, const uint64_t *regs) {
-    if (!me) { sched_yield(); return; }
+    if (!me) { host_yield(); return; }
     static int clock_on = -1;   // DM_YIELD_CLOCK: 0 = clock waits are yields as any other, 1 = they back off from their start but sleep to no predicted end, 2 (the default) = both
     if (clock_on < 0) { const char *e = getenv("DM_YIELD_CLOCK"); clock_on = e && *e ? atoi(e) : 2; if (clock_on != 2) LOG("DM_YIELD_CLOCK=%d: yield loops that read the clock %s", clock_on, clock_on ? "back off from their start, with no sleep to a predicted end" : "back off after the start, as other yields"); }
     uint64_t y0 = now_ns(), sig = 0xcbf29ce484222325ull;
@@ -892,7 +933,7 @@ static void clock_wait(thr_t *me, uint64_t sig, uint64_t now, int predict) {
     } else if (me->cw_pred) {   // polling after the predicted sleep
         me->cw_after++;
         uint64_t past = now > me->cw_wake ? now - me->cw_wake : 0;
-        if (past < 2 * CW_MARGIN) sched_yield(); else yield_for(me, past - 2 * CW_MARGIN, 1);
+        if (past < 2 * CW_MARGIN) host_yield(); else yield_for(me, past - 2 * CW_MARGIN, 1);
         return;
     }
     yield_for(me, now - me->yrun_t0, 1);

@@ -128,6 +128,16 @@ static void rec_note_wait(_Atomic uint64_t *p, uint64_t v) {
     pthread_mutex_lock(&g_note_mu); while (atomic_load(p) < v) pthread_cond_wait(&g_note_cv, &g_note_mu); pthread_mutex_unlock(&g_note_mu);
 }
 
+// Cover every replay-queue submission, including upload buffers without frame tags.
+static MTL4CommitOptions *rec_flow_options(MTL4CommitOptions *o) {
+    if (!nvn_flow_on()) return o;
+    MTL4CommitOptions *options = o ? o : [MTL4CommitOptions new];
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+        nvn_flow_event("queue", UINT64_MAX, 1, f.GPUStartTime, f.GPUEndTime);
+    }];
+    return options;
+}
+
 // ---------- The encode thread ----------
 static id g_rx_cb, g_rx_enc;   // the encode thread's real command buffer and open encoder
 // ---------- Submissions committed together ----------
@@ -200,7 +210,10 @@ static void rx_commit(int cur, DmCommitFB *own, uint64_t ubc) {
             for (void (^b)(id<MTL4CommitFeedback>) in ((DmCommitFB *)fbs[(NSUInteger)i])->blocks) b((id<MTL4CommitFeedback>)part); }
     }];
     pthread_mutex_lock(&g_res_commit_mu);
-    [g_q4 commit:buffers count:(NSUInteger)nb options:o]; rx_mark();
+    MTL4CommitOptions *flow_options = rec_flow_options(o); double flow_submit = nvn_flow_begin();
+    [g_q4 commit:buffers count:(NSUInteger)nb options:flow_options];
+    if (flow_submit) nvn_flow_event("queue submit", UINT64_MAX, 0, flow_submit, nvn_flow_clock());
+    rx_mark();
     pthread_mutex_unlock(&g_res_commit_mu);
     if (cur) g_rx_cb = nil;
     g_rx_cbs++; g_rx_merged += (uint64_t)n; g_rx_last_nb = nb;
@@ -232,7 +245,9 @@ static void rec_exec(const rec_t *r) {
         rx_flush();
         id<MTL4CommandBuffer> buffers[] = {rec_id(a[1])}; MTL4CommitOptions *o = rec_id(a[0]);
         pthread_mutex_lock(&g_res_commit_mu);   // apart from the residency set's commit, as the present snapshot's queue commit (nvn_mtl.m res_commit)
-        if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
+        MTL4CommitOptions *flow_options = rec_flow_options(o); double flow_submit = nvn_flow_begin();
+        if (flow_options) [g_q4 commit:buffers count:1 options:flow_options]; else [g_q4 commit:buffers count:1];
+        if (flow_submit) nvn_flow_event("queue submit", UINT64_MAX, 0, flow_submit, nvn_flow_clock());
         rx_mark(); pthread_mutex_unlock(&g_res_commit_mu);
         break; }
     case RO_SIGNAL:
@@ -488,13 +503,17 @@ static void rec_commit(id cb, DmCommitFB *fb, int end) {   // end: the submissio
     if ([cb isKindOfClass:[DmRecCB class]]) { rec_t *r = rec_put(RO_COMMIT, 1); r->a[0] = rec_obj(fb); r->a[2] = ubc_head(); r->a[5] = (uint64_t)end; return; }
     ubc_wait(ubc_head());
     id<MTL4CommandBuffer> buffers[] = {cb}; MTL4CommitOptions *o = commit_opts(fb);
-    if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
+    MTL4CommitOptions *flow_options = rec_flow_options(o); double flow_submit = nvn_flow_begin();
+    if (flow_options) [g_q4 commit:buffers count:1 options:flow_options]; else [g_q4 commit:buffers count:1];
+    if (flow_submit) nvn_flow_event("queue submit", UINT64_MAX, 0, flow_submit, nvn_flow_clock());
 }
 // An upload batch: its place in the queue is after what is recorded so far (it reads no uniform shadow)
 static void rec_commit_upload(id cb, MTL4CommitOptions *o) {
     if (rec_on() && g_rb_started) { rec_t *r = rec_put(RO_COMMIT_REAL, 2); r->a[0] = rec_obj(o); r->a[1] = rec_obj(cb); return; }
     id<MTL4CommandBuffer> buffers[] = {cb};
-    if (o) [g_q4 commit:buffers count:1 options:o]; else [g_q4 commit:buffers count:1];
+    MTL4CommitOptions *flow_options = rec_flow_options(o); double flow_submit = nvn_flow_begin();
+    if (flow_options) [g_q4 commit:buffers count:1 options:flow_options]; else [g_q4 commit:buffers count:1];
+    if (flow_submit) nvn_flow_event("queue submit", UINT64_MAX, 0, flow_submit, nvn_flow_clock());
 }
 // A queue operation (a sparse texture's mapping update, nvn_mtl.m sparse_*): on the encoding thread in its place among the recorded commits, so it reaches the queue before the upload batch
 // committed after it and after the command buffers committed before it

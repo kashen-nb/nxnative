@@ -172,7 +172,32 @@ int main(void) {
       EXPECT("stub state takes precedence over env",60,fps_present_cap());
       *(uint32_t *)(state+4)=1;
       EXPECT("the state page's movie flag is the host's copy, not read for the cap",60,fps_present_cap());
+      // A 120 Hz screen must not halve the frame-step clock's 60 Hz periods.
+      nvn_present_config(120,0);atomic_store(&g_fs_k,1);
+      EXPECT("60 cap on 120 Hz: native period",16666666,present_period(&w));
+      atomic_store(&g_fs_k,2);
+      EXPECT("30 hold on 120 Hz: native period",33333333,present_period(&w));
+      EXPECT("30 hold keeps 60 deadline",16666666,rt_period_ns(&w,present_period(&w)));
+      nvn_present_config(0,0);
+      EXPECT("explicit unpaced profiling stays unpaced",0,present_period(&w));
+      atomic_store(&g_fs_k,0);
       dm_fps_state=NULL;unsetenv("DM_FPS_TARGET");g_present_cap=-1;nvn_present_config(0,0);
+    }
+    // The cap's clock unit is independent of the selected display refresh for
+    // every title: engine-native limiters, native-120 and uncapped presents.
+    { win_t w={.interval=1};dm_fps_state=NULL;g_engine_stub=1;
+      nvn_present_config(120,0);setenv("DM_FPS_TARGET","60",1);g_present_cap=-1;
+      EXPECT("engine cap60 on display120 stays60",16666666,present_period(&w));
+      setenv("DM_FPS_TARGET","30",1);g_present_cap=-1;
+      EXPECT("engine cap30 on display120 stays30",33333333,present_period(&w));
+      g_fps_high=1;atomic_store(&g_high_cap,120);
+      EXPECT("native120 keeps its120 clock",8333333,present_period(&w));
+      g_fps_high=0;g_engine_stub=0;setenv("DM_FPS_TARGET","0",1);g_present_cap=-1;
+      EXPECT("uncapped interval1 keeps display120",8333333,present_period(&w));
+      w.interval=2;
+      EXPECT("uncapped interval2 keeps display120",16666666,present_period(&w));
+      atomic_store(&g_high_cap,60);
+      unsetenv("DM_FPS_TARGET");g_present_cap=-1;nvn_present_config(0,0);
     }
     // No frame step page and no engine limiter the host writes (a main the profile's
     // stubs or limiter rows do not know): nothing makes the game follow the cap, so
@@ -983,6 +1008,45 @@ int main(void) {
         EXPECT("compact records expand to the canonical ones, in no more bytes", 0, bad);
         EXPECT("compact records are smaller in most cases", 1, smaller >= 35);
         P(nvnCommandBufferFinalize)(&ce); P(nvnMemoryPoolFinalize)(&mp);
+    }
+    // Cached recordings can re-record only their uniform bindings in place.
+    // Changing an address or range must not shift the untouched command tail.
+    {
+        static uint8_t m[4096] __attribute__((aligned(4096)));
+        NVNmemoryPoolBuilder mb; NVNmemoryPool mp; NVNcommandBuffer cu;
+        P(nvnMemoryPoolBuilderSetDefaults)(&mb); P(nvnMemoryPoolBuilderSetStorage)(&mb, m, sizeof m); P(nvnMemoryPoolInitialize)(&mp, &mb);
+        P(nvnCommandBufferInitialize)(&cu, &dev);
+        P(nvnCommandBufferAddCommandMemory)(&cu, &mp, 0, sizeof m); P(nvnCommandBufferBeginRecording)(&cu);
+        P(nvnCommandBufferBindUniformBuffer)(&cu, NVN_SHADER_STAGE_VERTEX, 2, 0x40010, 976);
+        P(nvnCommandBufferBindUniformBuffer)(&cu, NVN_SHADER_STAGE_VERTEX, 3, 0x50000, 48);
+        P(nvnCommandBufferBindUniformBuffer)(&cu, NVN_SHADER_STAGE_VERTEX, 1, 0x60000, 256);
+        size_t before = P(nvnCommandBufferGetCommandMemoryUsed)(&cu);
+        P(nvnCommandBufferBarrier)(&cu, NVN_BARRIER_ORDER_PRIMITIVES_BIT);
+        NVNcommandHandle original = P(nvnCommandBufferEndRecording)(&cu);
+        uint64_t piece = ctl_at(original, 0); size_t original_size = ctl_chunk_bytes(piece);
+        uint8_t tail[8]; memcpy(tail, m + before, sizeof tail);
+        P(nvnCommandBufferAddCommandMemory)(&cu, &mp, 0, sizeof m); P(nvnCommandBufferBeginRecording)(&cu);
+        P(nvnCommandBufferBindUniformBuffer)(&cu, NVN_SHADER_STAGE_VERTEX, 2, 0x40000, 976);
+        P(nvnCommandBufferBindUniformBuffer)(&cu, NVN_SHADER_STAGE_VERTEX, 3, 0x50000, 48);
+        P(nvnCommandBufferBindUniformBuffer)(&cu, NVN_SHADER_STAGE_VERTEX, 1, 0x60000, 256);
+        P(nvnCommandBufferEndRecording)(&cu);
+        EXPECT("uniform rewrite keeps the original byte span", before, P(nvnCommandBufferGetCommandMemoryUsed)(&cu));
+        int valid = 1; size_t off = 0;
+        while (off < original_size) {
+            op_hdr h; if (original_size - off < sizeof h) { valid = 0; break; } memcpy(&h, m + off, sizeof h);
+            if (h.size < 8 || (h.size & 7) || h.size > original_size - off) { valid = 0; break; } off += h.size;
+        }
+        EXPECT("uniform rewrite preserves the cached command chain", 1, valid);
+        EXPECT("uniform rewrite leaves the command tail untouched", 1, !memcmp(tail, m + before, sizeof tail));
+        // Crossing the compact range-size threshold must keep that span too.
+        P(nvnCommandBufferAddCommandMemory)(&cu, &mp, 0, sizeof m); P(nvnCommandBufferBeginRecording)(&cu);
+        P(nvnCommandBufferBindUniformBuffer)(&cu, NVN_SHADER_STAGE_VERTEX, 2, 0x40000, 1u << 18);
+        size_t large = P(nvnCommandBufferGetCommandMemoryUsed)(&cu); P(nvnCommandBufferEndRecording)(&cu);
+        P(nvnCommandBufferAddCommandMemory)(&cu, &mp, 0, sizeof m); P(nvnCommandBufferBeginRecording)(&cu);
+        P(nvnCommandBufferBindUniformBuffer)(&cu, NVN_SHADER_STAGE_VERTEX, 2, 0x40000, 976);
+        size_t small = P(nvnCommandBufferGetCommandMemoryUsed)(&cu); P(nvnCommandBufferEndRecording)(&cu);
+        EXPECT("uniform binding size is independent of buffer range", large, small);
+        P(nvnCommandBufferFinalize)(&cu); P(nvnMemoryPoolFinalize)(&mp);
     }
     // 5b''. Host segment sizes (hostseg_size), as Super Mario Odyssey grants 512 bytes from an empty pool before recording: such a grant gets a HOSTSEG_SMALL segment; a recording
     //       that outgrows it with no callback goes on in a full one, as a second piece of its control list, and replays whole through its handle; a record larger than HOSTSEG_SZ gets a segment that holds it;

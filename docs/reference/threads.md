@@ -330,6 +330,14 @@ The yield back-off (`DM_YIELD_BACKOFF`) and the rewriter's spin waits (`patch_ns
 - **Check:** `make -C dm/host/tests GAME=<id> preempt` (`service_request_start`): with no request the starter is held to the worker's end and the flag stays set, as the game saw it; with one or two, in both scheduling modes, the worker sees the flag and clears it. On the game: a save, reopening the screen, loading and saving again, twelve overwrites in a row, a restart.
 - **Found on:** [Digimon Story Cyber Sleuth: Complete Edition](../../dm/games/010014E00DB56000/README.md#saves) ([issue #769](https://github.com/seedds/nxnative/issues/769)).
 
+
+### A short yield depresses a job worker for a host quantum
+
+- **Symptom:** long CPU frames while GPU work remains short; the main thread waits for job completion and the job workers repeatedly spend about 10 ms in SleepThread(-1).
+- **Cause:** Darwin's sched_yield/cthread_yield can depress the caller's scheduling priority for a host quantum. On a loaded M4 Pro, a standalone 300-call test at user-interactive QoS measured 10.02 ms median per call; a non-depressing Mach thread_switch measured 0.5 microseconds. Horizon's short yield does not promise a whole host quantum of lower priority. Duration tracing followed the main thread's LightEvent through ModuleSystem workers to BaseProcExecutor workers: the main resumed about 26 microseconds after a signal, but workers repeatedly lost 10 ms in their polling yields. The delay preceded the signal, not the wake-up.
+- **Fix:** hle_thread.c uses thread_switch(MACH_PORT_NULL, SWITCH_OPTION_NONE, 0) for immediate host yields. Existing progress detection, idle back-off, clock-wait prediction and guest synchronization remain in place.
+- **Check:** t_clockwait requires the non-depressing option and preserves its simulated limiter deadlines; t_pollwait, t_preempt and t_condvar pass. A 45-second camera-turn run after the fix had frame p99 33.75 ms, maximum 41.14 ms, correct game-time speed and no red errors. It still exceeded the GPU budget with experimental frame generation; this is not a locked-60/120 claim.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#frame-rate).
 ### Queue polls with exclusive retries and no clrex
 
 - **Symptom:** Breath of the Wild 1.6.0 shows frames of 100–600 ms every few seconds while the GPU's work stays at 8–17 ms; in every stall the main thread and both workers are in one job queue poll (`main+0x12c0e48`). It is the starvation 1.9.0 had in the same poll ([CPU hitches](../../dm/games/01007EF00011E000/README.md#cpu)): the workers take and release the queue's lock at full speed, and the main thread, whose item they wait for, loses nearly every exclusive store to them.

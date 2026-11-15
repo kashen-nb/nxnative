@@ -14,6 +14,8 @@ $(B)/t_fs $(B)/t_fs_case $(B)/t_fs_commit_list $(B)/t_fs_commit_list_tsan: ../ro
 GAME_H = ../gen/$(GAME)/game_profile.h
 run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_clockwait $(B)/t_pause $(B)/t_pause_stress $(B)/t_pctl $(B)/t_sf $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid $(B)/t_switch2
 	$(B)/t_language
+	$(B)/t_codec_cadence
+	$(B)/t_oot_output_size
 	$(B)/t_heap_size
 	$(B)/t_touch
 	$(B)/t_gesture
@@ -81,6 +83,12 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
 	TMPDIR="$(abspath $(B))" $(B)/t_cheats $(QUIET)
 	$(B)/t_nro
 	$(B)/t_symbols
+run: $(B)/t_codec_cadence
+run: $(B)/t_oot_output_size
+$(B)/t_oot_output_size: t_oot_output_size.c ../../mac/oot_output_size.h | $(B)
+	$(CLANG) -std=c11 -O1 -Wall -Wextra -Werror -o $@ $<
+$(B)/t_codec_cadence: t_codec_cadence.c ../codec_cadence.h | $(B)
+	$(CLANG) -std=c11 -O1 -Wall -Wextra -Werror -o $@ $<
 run: $(B)/t_nro
 run: $(B)/t_sync_wait
 $(B)/t_sync_wait: t_sync_wait.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) | $(B)
@@ -234,6 +242,17 @@ $(B)/t_shared_font: t_shared_font.c ../hle_sdk16.c ../hle.h ../dm.h $(GAME_H) | 
 run: $(B)/t_vi_history
 $(B)/t_vi_history: t_vi_history.c ../../gfx/hle_vi.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_vi_history.c
+# Native HDR discovery is opt-in and not a statement of physical display support. Cached environment modes run in separate processes.
+$(B)/t_vi_hdr: t_vi_hdr.c ../../gfx/hle_vi.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_vi_hdr.c
+.PHONY: vi-hdr
+run: vi-hdr
+vi-hdr: $(B)/t_vi_hdr
+	env -u DM_VI_HDR_TRACE -u DM_VI_HDR_PROBE $(B)/t_vi_hdr default
+	DM_VI_HDR_TRACE=1 DM_VI_HDR_PROBE=0 $(B)/t_vi_hdr trace
+	DM_VI_HDR_TRACE=0 DM_VI_HDR_PROBE=1 $(B)/t_vi_hdr probe
+	DM_VI_HDR_TRACE=1 DM_VI_HDR_PROBE=1 $(B)/t_vi_hdr probe
+	DM_VI_HDR_TRACE=2 DM_VI_HDR_PROBE=yes $(B)/t_vi_hdr default
 run: $(B)/t_nv
 $(B)/t_nv: t_nv.c ../../gfx/hle_nv.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_nv.c
@@ -437,3 +456,20 @@ coverage:
 	rm -rf $(B)/cov/prof
 	LLVM_PROFILE_FILE="$(call cov_profile,$(B)/cov)" $(MAKE) -i B=$(B)/cov SAN="$(COV_FLAGS)" run
 	@$(call cov_export,$(B)/cov)
+
+# Native-pixel fullscreen mode selection: CPU-only, no display reconfiguration.
+$(B)/t_screen_mode: t_screen_mode.c ../front_screen_mode.h | $(B)
+	$(CLANG) -std=c11 -O1 -g -Wall -Wextra -Werror -I.. -o $@ t_screen_mode.c
+.PHONY: screen-mode
+screen-mode: $(B)/t_screen_mode
+	$(B)/t_screen_mode
+run: screen-mode
+
+# Native EDR capability/content metadata; the forensic vi-hdr probe is separate.
+$(B)/t_vi_edr: t_vi_edr.c ../../gfx/hle_vi.c ../../gfx/tests/t_hdr_front.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_vi_edr.c ../../gfx/tests/t_hdr_front.c
+.PHONY: vi-edr
+vi-edr: $(B)/t_vi_edr
+	DM_TEST_HDR=0 $(B)/t_vi_edr
+	DM_TEST_HDR=1 $(B)/t_vi_edr
+run: vi-edr

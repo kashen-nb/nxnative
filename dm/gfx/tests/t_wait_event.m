@@ -290,10 +290,10 @@ static void event_signal_no_cut(void) {
     CHECK(P(nvnEventGetValue)(&event)==1 && P(nvnEventGetValue)(&second)==7,"both events hold their signalled values");
     P(nvnSyncFinalize)(&produced); P(nvnSyncFinalize)(&consumed); P(nvnEventFinalize)(&second);
 }
-// The submissions of one frame share a command allocator, and one that counts no samples takes no visibility buffer (PR #2090): 24 of them with the GPU held, three times
-// the pool, all encode without a wait for the GPU, which would never return here
+// The submissions of one frame share a command allocator, and one that counts no samples takes no visibility buffer (PR #2090): 160 of them with the GPU held, beyond
+// the former128entry post ring, all encode without a wait for the GPU, which would never return here
 static void frame_shares_allocator(void) {
-    enum { N=24 };
+    enum { N=160 };
     printf("CASE a frame's submissions share a command allocator\n");
     *source=before; *result=sentinel;
     id<MTLSharedEvent> gate=[g_dev newSharedEvent];
@@ -306,10 +306,11 @@ static void frame_shares_allocator(void) {
         if(!returned(&jobs[i],2000000000ull) || !receipt_encoded(&fences[i],2000000000ull)) break;
         submitted++; encoded++;
     }
-    CHECK(submitted==N && encoded==N,"24 submissions encode while the GPU is held");
+    CHECK(submitted==N && encoded==N,"160 submissions encode while the GPU is held");
+    CHECK(POST_RING>=N,"the post ring covers every held submission");
     pthread_mutex_lock(&g_sub_mu);
     CHECK(g_alloc_waits==waits,"none waited for the GPU to free an allocator");
-    CHECK(g_alloc_n<=pool+1 && g_alloc_shares-shares>=N-2,"they share the frame's allocator");
+    CHECK(g_alloc_n<=pool+4 && g_alloc_shares-shares>=N-4,"they share the frame's allocator");
     CHECK(g_vis_ring_n==ring,"none took a visibility buffer");
     pthread_mutex_unlock(&g_sub_mu);
     CHECK(*result==sentinel,"nothing has run while the gate holds the GPU");

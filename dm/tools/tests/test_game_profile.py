@@ -54,11 +54,11 @@ MAP = ('# kind: evidence  Test shaders\n# column 5 records where each key first 
        'cs_other.bin\t10\tcompute\tba079f68ae288dba\t/Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs#NDVE@0x1423e8\n')   # that file's own movie network: not the pack's
 
 
-def macros(shader_map):
+def macros(shader_map, rows=""):
     """The upscaler macros of a synthetic profile's header, with this shader map (None: none)"""
     with tempfile.TemporaryDirectory() as d:
         Path(d, ID).mkdir()
-        (Path(d, ID) / 'game.tsv').write_text(TSV)
+        (Path(d, ID) / 'game.tsv').write_text(TSV + rows)
         if shader_map is not None: (Path(d, ID) / 'shader_map.tsv').write_text(shader_map)
         subprocess.run([sys.executable, str(GAME), 'header', ID, str(Path(d, ID) / 'game.h')], env={**os.environ, 'DM_GAMES_DIR': d}, check=True, capture_output=True)
         return [l for l in (Path(d, ID) / 'game.h').read_text().splitlines() if 'UPSCALER' in l]
@@ -66,10 +66,32 @@ def macros(shader_map):
 
 class UpscalerKeys(unittest.TestCase):
     def test_from_shader_map(self):
-        none = ['#define DM_GAME_UPSCALER_KEYS ""', '#define DM_GAME_UPSCALER_N 0']   # the launcher hides the setting
+        none = ['#define DM_GAME_UPSCALER_RECIPE ""', '#define DM_GAME_UPSCALER_KEYS ""', '#define DM_GAME_UPSCALER_N 0']   # the launcher hides the setting
         self.assertEqual(macros(None), none)
         self.assertEqual(macros(MAP.split('cs_other.bin')[0]), none)
-        self.assertEqual(macros(MAP), ['#define DM_GAME_UPSCALER_KEYS "7629d857a0a93833,805f2de96bd6d78d,c2fc2ddd604c25e7,c56db3d5a0f1b5af,ddc729bcdb4c8df9,fa3033d05c0a41d6"', '#define DM_GAME_UPSCALER_N 6'])
+        self.assertEqual(macros(MAP), ['#define DM_GAME_UPSCALER_RECIPE ""', '#define DM_GAME_UPSCALER_KEYS "7629d857a0a93833,805f2de96bd6d78d,c2fc2ddd604c25e7,c56db3d5a0f1b5af,ddc729bcdb4c8df9,fa3033d05c0a41d6"', '#define DM_GAME_UPSCALER_N 6'])
+
+
+class UpscalerRecipe(unittest.TestCase):
+    RECIPE = 'fa3033d05c0a41d6_b\tsqrt_linear\t1536\t864\t2048\t1152\t2\t4\t32\t36\t1'
+
+    def test_vetted_recipe_is_emitted_without_reclassifying_legacy_shaders(self):
+        result = macros(None, 'upscaler_recipe\t' + self.RECIPE + '\n')
+        self.assertIn('#define DM_GAME_UPSCALER_RECIPE "' + self.RECIPE.replace('\t', ',') + '"', result)
+        self.assertIn('#define DM_GAME_UPSCALER_N 0', result)
+
+    def test_invalid_recipes_are_rejected(self):
+        bad = [self.RECIPE.replace('_b', ''), self.RECIPE.replace('sqrt_linear', 'srgb'),
+               self.RECIPE.replace('1536', '0'), self.RECIPE.replace('2048', '1024'),
+               self.RECIPE.replace('\t2\t4\t', '\t4\t4\t'),
+               self.RECIPE.rsplit('\t', 1)[0] + '\t0', self.RECIPE + '\textra']
+        for recipe in bad:
+            rc, out = header('upscaler_recipe\t' + recipe + '\n')
+            self.assertNotEqual(rc, 0, recipe)
+            self.assertIn('upscaler_recipe', out)
+        rc, out = header(('upscaler_recipe\t' + self.RECIPE + '\n') * 2)
+        self.assertNotEqual(rc, 0)
+        self.assertIn('upscaler_recipe', out)
 
 
 if __name__ == '__main__':

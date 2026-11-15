@@ -306,6 +306,15 @@ A game may tell NVN objects apart by their bytes, without an NVN call. A host re
 - **Symptom:** the serial table grows by about 10 entries a frame (276,000 after 25,000 frames).
 - **Cause:** a game that records transient render targets and finalizes them before it submits: replay put the dead serials back into `g_by_serial`.
 - **Fix:** dead serials go to a table of their own (`tex_put`, `g_ghost`; the memory line's `finalized textures still referenced`), which keeps 512 once idle ([More finalized textures in use than their table held](#more-finalized-textures-in-use-than-their-table-held)).
+
+### Texture data changed between registrations of the same pool memory
+
+The earlier fork backport of [pool registration epochs](#a-pool-registered-over-memory-an-earlier-pool-held-counts-older-stamps-as-written) was checked on the M4 Pro: all three old-stamp queries in `t_dirty_slots` fail with the original tracker and pass with the fix; dirty race and retirement-race fixtures also passed. This synthetic proof does not attribute an OOT graphical artifact to the tracker. The current upstream implementation and lifetime race fixes are described above.
+
+### Rebuilding views of finalized textures still used by registered IDs
+
+Historical fork validation, before the newer upstream texture-based view cache: the ghost-view retention backport passed `check_t_vc_ghost` (19 checks enabled, 17 disabled), targeted lifetime fixtures and a bounded Castle Town SDR MetalFX/interpolation run. No M4 Pro FPS gain was established. The current general cache is described in [Texture views made again for render targets initialized again every frame](frame-rate.md#texture-views-made-again-for-render-targets-initialized-again-every-frame); the former ghost-view-only mechanism is not an additional optimization on top of it.
+
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) (the HUD captures, the 640×360 buffers; found while fixing GitHub issue #9).
 - **Note:** the tables are `nvn_owner.m`'s (dm/gfx/README.md). `t_serial_owner` holds them to their behaviour, linked with the owner alone: live registration, replacement and removal, where `tex_put` sends a serial (live table for a live texture object or an external texture, ghost ring for a finalized one), finalizing, eviction by use past 512, texture and program pins, a view's entry counting its parent, and the held counts (`g_by_serial_held`, `g_ghost_held`, pins included) against the tables after every step.
 
@@ -482,6 +491,15 @@ Games read this count as a position in their own command memory and size their h
 - **Fix:** a single texture bind is recorded as `OP_BIND_TEX1`, its handle 16 bytes in, in the hardware's layout (`nvn_obj.h` `p_bind_tex1`, read through `bind_rec`); every game.
 - **Found on:** [Luigi's Mansion 3](../../dm/games/0100DCA0064A6000/README.md). Found with a check that reports a bind record holding more than 32 handles (`[RED] bind record … overwritten after recording`), then `DM_PROBE_WATCH` on that word.
 - **Note:** any other command a game patches this way needs the same: find the readers of the `GetCommandMemoryUsed` slot first.
+
+
+### Uniform bindings re-recorded in place keep their byte span
+
+- **Symptom:** a cached command list aborts on a payload interpreted as a record header, 144 bytes into a 224- or 248-byte piece. Seen while enabling Ocarina's native motion buffer, after experimentally refreshing its stale material shader references.
+- **Cause:** a single uniform binding used a 16-byte compact record for a 256-aligned address and a range below 2^18, otherwise the existing 24-byte form. Re-recording only a block's uniform bindings could therefore shorten that block without moving the untouched command tail. Reservation receipts showed newer uniform records at offsets 96/112/128 over an older block with records at 120/136 and its following storage binding still at 152. Per-record allocation and callback invariants stayed valid: each individual new reservation was correct, but the earlier cached list retained the old boundaries.
+- **Fix:** valid single BindUniformBuffer calls always use the existing 24-byte OP_BIND_UBO_SMALL form, independent of address alignment and range size. Multi-binding compact records are unchanged.
+- **Check:** t_nvn records three uniform bindings and a barrier, re-records the bindings at the same address with different alignment, and checks the old list and untouched tail. Before this fix the block shrinks from 56 to 48 bytes and the old chain is invalid; after it both blocks occupy 72 bytes and the chain remains valid. Crossing the compact range-size threshold is checked separately. The targeted NVN suite passes 306 checks and queue-origin passes 398.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md). A bounded copied-save run then exits cleanly after 70 seconds. Two texture-type warnings and visibly white/flickering eyes remain; this is not validation of the native motion field or the late material-refresh experiment. Broad gameplay regression is still pending.
 
 ## Queues and syncs
 
