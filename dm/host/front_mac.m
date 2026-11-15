@@ -202,6 +202,7 @@ static home_quit g_hq;   // the Home button's hold and quit prompt (home_quit.h)
 static int g_press_to_join;   // DM_PAD_PRESS_TO_JOIN=1, below pad_read
 static int pad_join(const void *owner, const char *name);
 static const char *pad_name(GCController *c);
+static void pad_lights(GCController *c, int p);
 static void pro_players_changed(GCController *gone);
 static void pad_read(GCExtendedGamepad *g) {
     if (!g_input_on) return;
@@ -216,7 +217,7 @@ static void pad_read(GCExtendedGamepad *g) {
     #undef K
     if (p < 0) {   // DM_PAD_PRESS_TO_JOIN=1: it joins at its first button
         GCController *c = g.controller; if (!m || (p = pad_join((__bridge const void *)c, pad_name(c))) < 0) return;
-        g_held[p] = c; dm_motion_attach(c, p); pro_players_changed(nil);
+        g_held[p] = c; pad_lights(c, p); dm_motion_attach(c, p); pro_players_changed(nil);
     }
     if (cp_poll()) return;   // the controller applet's prompt has the controllers (front_ctrl_support)
     if (g_merge_s2_rumble && m) merge_rumble_to_s2(0);   // DM_PAD_MERGE: a button on this controller takes player 1's rumble back from a Switch 2 pad
@@ -230,6 +231,11 @@ static void pad_keep_system_buttons(GCController *c) {
     c.extendedGamepad.buttonHome.pressedChangedHandler = ^(GCControllerButtonInput *b, float v, BOOL down) { (void)b; (void)v; (void)down; if (g_input_on) hq_poll(); };
 }
 static const char *pad_name(GCController *c) { return c.vendorName.UTF8String ?: "?"; }
+// Player lights of player p (pad_apple.h), and a log line when it has a player
+static void pad_lights(GCController *c, int p) {
+    if (dm_pad_lights(c, p)) LOG("controller '%s': player lights %d", pad_name(c), p + 1);
+    else if (p >= 0) LOG("controller '%s': player lights off (only players 1-4 have them)", pad_name(c));
+}
 static void npad_name(int p, char *out, size_t cap) { uint32_t id = dm_player_npad(p); if (id == 0x20) snprintf(out, cap, "handheld"); else snprintf(out, cap, "%u", id); }
 static void pro_players_changed(GCController *gone) {
     int count = 0, player = -1;
@@ -260,7 +266,7 @@ static void pads_changed(GCController *gone) {
     if (g_merge) {
         int any = 0;
         for (GCController *c in GCController.controllers) if (c.extendedGamepad && c != gone) {
-            any = 1; pad_keep_system_buttons(c); c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
+            any = 1; pad_keep_system_buttons(c); pad_lights(c, 0); c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
             dm_motion_attach(c, 0);   // every controller is player 1: the last one moved drives its six-axis sensor
             pad_read(c.extendedGamepad);
         }
@@ -273,7 +279,7 @@ static void pads_changed(GCController *gone) {
     NSArray<GCController *> *now = GCController.controllers; char nb[16];
     for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p] && (g_held[p] == gone || ![now containsObject:g_held[p]] || hidpad_gc_unread(g_held[p]))) {
         npad_name(p, nb, sizeof nb); LOG("controller '%s' disconnected: player %d (npad %s) is free", pad_name(g_held[p]), p + 1, nb);
-        g_held[p].extendedGamepad.valueChangedHandler = nil;
+        g_held[p].extendedGamepad.valueChangedHandler = nil; pad_lights(g_held[p], -1);
         dm_motion_detach(g_held[p], p);
         dm_haptics_apple_controller(p, nil);
         pad_slot_free(&g_slots, (__bridge const void *)g_held[p]); g_held[p] = nil;
@@ -289,7 +295,7 @@ static void pads_changed(GCController *gone) {
         }
         int p = pad_slot_take(&g_slots, (__bridge const void *)c, pad_name(c));
         if (p < 0) { LOG("controller '%s' connected: all %d players are taken, not used", pad_name(c), DM_PLAYERS); continue; }
-        g_held[p] = c; pad_keep_system_buttons(c);
+        g_held[p] = c; pad_keep_system_buttons(c); pad_lights(c, p);
         c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_read(g); };
         dm_motion_attach(c, p);
         npad_name(p, nb, sizeof nb); LOG("controller '%s' connected: player %d (npad %s)%s", pad_name(c), p + 1, nb, c.motion.hasRotationRate ? ", with motion (gyro)" : "");
