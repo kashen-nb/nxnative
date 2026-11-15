@@ -2775,7 +2775,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[174];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[175];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -18353,7 +18353,7 @@ static uint64_t snap_take(const tex_t *t) {
 }
 // ---------- Stereo tap (mtl_stereo.h; dm/host/immersive_mac.m draws the picture for each eye of a Vision Pro from it) ----------
 // Off unless mtl_stereo_enable(1). Each present's picture is drawn, as the screen gets it, into a ring of host textures (st_present), and the depth of the frame's scene is copied
-// into another (st_take_depth): the depth attachment that took the most depth-writing draws in passes with a colour attachment (a shadow map's pass has none). A consumer on another
+// into another (st_take_depth): the depth/colour attachment pair that took the most depth-writing draws (a shadow map's pass has no colour). A consumer on another
 // queue pins the newest finished pair (mtl_stereo_acquire); a slot is written again only when nothing pins it and its last copy has run. NVN presents only have a depth: the Vulkan
 // and GL layers draw with their own encoders, so their pictures come without one.
 // A HUD is drawn over the picture without the depth test, so the scene's depth lies under it. The window texture as it was before its first overlay is copied in the frame (the
@@ -18365,15 +18365,16 @@ static uint64_t snap_take(const tex_t *t) {
 #define ST_CAND 16
 static _Atomic int g_st_on;
 static pthread_mutex_t g_st_mu = PTHREAD_MUTEX_INITIALIZER;
-static struct { id<MTLTexture> tex; NSUInteger level, slice; uint32_t draws, rev; float x0, y0, x1, y1; } g_st_cand[ST_CAND];   // the frame being replayed; under g_st_mu but its counts
+static struct { id<MTLTexture> tex, color; NSUInteger level, slice, clevel, cslice; uint32_t draws, rev; float x0, y0, x1, y1; } g_st_cand[ST_CAND];   // the frame being replayed; under g_st_mu but its counts
 static int g_st_ncand, g_st_cur = -1;
-static struct { id<MTLTexture> tex, src, base; uint64_t gen, ev; int pins, rev, flip, has_base; float rect[4]; } g_st_d[ST_D];   // base: the window texture before its overlays
+static struct { id<MTLTexture> tex, src, base, reference, ref_src, ref_view; uint64_t gen, ev; int pins, rev, flip, has_base, has_ref; float rect[4]; } g_st_d[ST_D];   // base: the window texture before its overlays
 static struct { id<MTLTexture> tex, view, btex, bview; int pins, busy, has_base; } g_st_c[ST_C];   // btex: the base drawn as the picture is
 // The window textures of the frame being replayed: est, the picture is laid down (its first draw, a depth-tested draw or a copy into it); taken, its base is copied (st_overlay)
 static struct { uint64_t ser; int est, taken; } g_st_w[4]; static int g_st_resv = -1; static uint64_t g_st_resv_ser;   // resv: the depth slot that holds this frame's base
 static struct { int c, d; uint64_t seq; } g_st_pub = {-1, -1, 0};
 static id<MTL4CommandAllocator> g_st_dalloc[ST_D], g_st_calloc[ST_C]; static id<MTL4CommandBuffer> g_st_dcb[ST_D], g_st_ccb[ST_C]; static id<MTLBuffer> g_st_uv[ST_C], g_st_buv[ST_C];
 static id<MTLResidencySet> g_st_res; static id<MTLSharedEvent> g_st_ev; static uint64_t g_st_v, g_st_gen;
+static id<MTLComputePipelineState> g_st_ref_pso; static id<MTL4ArgumentTable> g_st_ref_args[ST_D]; static id<MTLBuffer> g_st_ref_rect[ST_D];
 static __thread uint64_t g_st_tag;   // the depth copy of the present being processed (pq_item.st), for st_present
 void mtl_stereo_enable(int on) { if (atomic_exchange(&g_st_on, on != 0) != (on != 0)) MLOG("stereo tap %s", on ? "on: each present's picture and its scene depth are copied for the headset" : "off"); }
 // Pass begin (submit thread): the pass's depth attachment becomes the candidate its draws count for
@@ -18382,9 +18383,13 @@ static void st_pass(MTL4RenderPassDescriptor *pd) {
     id<MTLTexture> t = pd.depthAttachment.texture;
     if (!t || !pd.colorAttachments[0].texture || t.sampleCount != 1 || (t.textureType != MTLTextureType2D && t.textureType != MTLTextureType2DArray)) return;
     NSUInteger lv = pd.depthAttachment.level, sl = pd.depthAttachment.slice;
+    id<MTLTexture> color = pd.colorAttachments[0].texture;
+    NSUInteger clv = pd.colorAttachments[0].level, csl = pd.colorAttachments[0].slice;
     pthread_mutex_lock(&g_st_mu);
-    int i = 0; while (i < g_st_ncand && !(g_st_cand[i].tex == t && g_st_cand[i].level == lv && g_st_cand[i].slice == sl)) i++;
+    int i = 0; while (i < g_st_ncand && !(g_st_cand[i].tex == t && g_st_cand[i].level == lv && g_st_cand[i].slice == sl &&
+                                       g_st_cand[i].color == color && g_st_cand[i].clevel == clv && g_st_cand[i].cslice == csl)) i++;
     if (i == g_st_ncand && i < ST_CAND) { g_st_cand[i].tex = t; g_st_cand[i].level = lv; g_st_cand[i].slice = sl; g_st_cand[i].draws = g_st_cand[i].rev = 0;
+        g_st_cand[i].color = color; g_st_cand[i].clevel = clv; g_st_cand[i].cslice = csl;
         g_st_cand[i].x0 = g_st_cand[i].y0 = FLT_MAX; g_st_cand[i].x1 = g_st_cand[i].y1 = -FLT_MAX; g_st_ncand++; }
     if (i < g_st_ncand) g_st_cur = i;
     pthread_mutex_unlock(&g_st_mu);
@@ -18408,6 +18413,46 @@ static void st_init(void) {
     for (int i = 0; i < ST_C; i++) { g_st_calloc[i] = [g_dev newCommandAllocator]; g_st_ccb[i] = [g_dev newCommandBuffer]; g_st_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; [g_st_res addAllocation:g_st_uv[i]];
         g_st_buv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; [g_st_res addAllocation:g_st_buv[i]]; }
     [g_st_res commit];
+}
+// Keep a 32x18 image of the colour drawn with the chosen depth, in its raw row
+// order. Postprocessing can flip that image before presenting it (Unity does).
+// Matching these pixels to the final picture lets the eye pass recover that flip
+// without assuming a game's camera/projection convention or reading its uniforms.
+static int st_reference(id<MTL4ComputeCommandEncoder> ce, int k, id<MTLTexture> color, NSUInteger level, NSUInteger slice, const float rect[4]) {
+    if (!color || color.sampleCount != 1 || fmt_int_or_ds(color.pixelFormat) ||
+        (color.textureType != MTLTextureType2D && color.textureType != MTLTextureType2DArray)) return 0;
+    NSError *e = nil;
+    if (!g_st_ref_pso) {
+        id<MTLLibrary> lib = host_msl_lib(g_dev, nil, "stereo", &e);
+        g_st_ref_pso = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"reference"] error:&e] : nil;
+        if (!g_st_ref_pso) { RED_ONCE(174, "stereo tap: cannot build the scene reference pipeline: %s", e.localizedDescription.UTF8String); return 0; }
+    }
+    if (!g_st_ref_args[k]) {
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxTextureBindCount = 2; ad.maxBufferBindCount = 1;
+        g_st_ref_args[k] = [g_dev newArgumentTableWithDescriptor:ad error:&e];
+        g_st_ref_rect[k] = [g_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:32 height:18 mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        g_st_d[k].reference = [g_dev newTextureWithDescriptor:td];
+        if (!g_st_ref_args[k] || !g_st_ref_rect[k] || !g_st_d[k].reference) MDIE("stereo tap: cannot allocate the scene reference");
+        [g_st_res addAllocation:g_st_ref_rect[k]]; [g_st_res addAllocation:g_st_d[k].reference];
+    }
+    id<MTLTexture> view = color;
+    if (level || slice || color.textureType != MTLTextureType2D)
+        view = [color newTextureViewWithPixelFormat:color.pixelFormat textureType:MTLTextureType2D levels:NSMakeRange(level, 1) slices:NSMakeRange(slice, 1)];
+    if (!view) return 0;
+    // The slot is free only after its last GPU copy and every reader have finished.
+    if (g_st_d[k].ref_src != color) {
+        if (g_st_d[k].ref_src) [g_st_res removeAllocation:g_st_d[k].ref_src];
+        g_st_d[k].ref_src = color; [g_st_res addAllocation:color];
+    }
+    g_st_d[k].ref_view = view;
+    memcpy(g_st_ref_rect[k].contents, rect, 16); [g_st_res commit];
+    id<MTL4ArgumentTable> at = g_st_ref_args[k];
+    [at setTexture:view.gpuResourceID atIndex:0]; [at setTexture:g_st_d[k].reference.gpuResourceID atIndex:1]; [at setAddress:g_st_ref_rect[k].gpuAddress atIndex:0];
+    [ce setArgumentTable:at]; [ce setComputePipelineState:g_st_ref_pso];
+    [ce dispatchThreads:MTLSizeMake(32, 18, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    return 1;
 }
 static int st_slot_free(int i, uint64_t done) { return !g_st_d[i].pins && i != g_st_pub.d && i != g_st_resv && g_st_d[i].ev <= done; }
 static int st_slot_pick(void) {   // the free depth slot written longest ago; under g_st_mu
@@ -18462,7 +18507,10 @@ static uint64_t st_take_depth(const tex_t *t) {
         float w = MAX(1, src.width >> lv), h = MAX(1, src.height >> lv);
         float x0 = MAX(0, g_st_cand[b].x0), y0 = MAX(0, g_st_cand[b].y0), x1 = MIN(w, g_st_cand[b].x1), y1 = MIN(h, g_st_cand[b].y1);
         if (x1 > x0 && y1 > y0) { rc[0] = x0 / w; rc[1] = y0 / h; rc[2] = (x1 - x0) / w; rc[3] = (y1 - y0) / h; } }
-    for (int i = 0; i < g_st_ncand; i++) g_st_cand[i].tex = nil;
+    id<MTLTexture> color = b >= 0 ? g_st_cand[b].color : nil;
+    NSUInteger clv = b >= 0 ? g_st_cand[b].clevel : 0, csl = b >= 0 ? g_st_cand[b].cslice : 0;
+    if (color && ((color.width >> clv) != (src.width >> lv) || (color.height >> clv) != (src.height >> lv))) color = nil;
+    for (int i = 0; i < g_st_ncand; i++) { g_st_cand[i].tex = nil; g_st_cand[i].color = nil; }
     g_st_ncand = 0; g_st_cur = -1;
     int k = !src ? -1 : resv >= 0 ? resv : st_slot_pick();   // a reserved slot holds this frame's base already
     if (k < 0) { pthread_mutex_unlock(&g_st_mu); return 0; }
@@ -18483,9 +18531,10 @@ static uint64_t st_take_depth(const tex_t *t) {
     id<MTL4CommandBuffer> cb = g_st_dcb[k];
     [cb beginCommandBufferWithAllocator:g_st_dalloc[k]];
     id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
-    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];
+    [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()];
     [ce copyFromTexture:src sourceSlice:sl sourceLevel:lv sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-    [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];
+    g_st_d[k].has_ref = st_reference(ce, k, color, clv, csl, rc);
+    [ce barrierAfterStages:MTLStageAll beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];
     [ce endEncoding]; [cb endCommandBuffer];
     uint64_t v = ++g_st_v, gen = ++g_st_gen;
     g_st_d[k].ev = v; g_st_d[k].gen = gen; g_st_d[k].rev = rev; g_st_d[k].has_base = base && k == resv; g_st_d[k].flip = atomic_load_explicit(&g_origin_ll, memory_order_relaxed); memcpy(g_st_d[k].rect, rc, sizeof rc);
@@ -18558,7 +18607,8 @@ int mtl_stereo_acquire(mtl_stereo_frame *f) {
     if (c < 0) { pthread_mutex_unlock(&g_st_mu); return 0; }
     if (d >= 0 && g_st_ev.signaledValue < g_st_d[d].ev) d = -1;   // its copy has not run yet
     g_st_c[c].pins++; f->c = c; f->color = (__bridge void *)g_st_c[c].view; f->base = g_st_c[c].has_base ? (__bridge void *)g_st_c[c].bview : NULL; f->seq = g_st_pub.seq;
-    if (d >= 0) { g_st_d[d].pins++; f->d = d; f->depth = (__bridge void *)g_st_d[d].tex; f->depth_rev = g_st_d[d].rev; f->depth_flip = g_st_d[d].flip; memcpy(f->depth_rect, g_st_d[d].rect, sizeof f->depth_rect); }
+    if (d >= 0) { g_st_d[d].pins++; f->d = d; f->depth = (__bridge void *)g_st_d[d].tex; f->depth_rev = g_st_d[d].rev; f->depth_flip = g_st_d[d].flip; memcpy(f->depth_rect, g_st_d[d].rect, sizeof f->depth_rect);
+        f->reference = g_st_d[d].has_ref ? (__bridge void *)g_st_d[d].reference : NULL; }
     pthread_mutex_unlock(&g_st_mu);
     return 1;
 }

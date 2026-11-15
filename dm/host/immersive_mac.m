@@ -29,6 +29,7 @@ typedef struct { simd_float4x4 mvp; simd_float4 drect, par; simd_uint4 opt; } st
 #define NEAR_H 18
 static id<MTLDevice> g_dev; static id<MTLCommandQueue> g_q; static id<MTLLibrary> g_lib;
 static id<MTLSamplerState> g_ls, g_ns; static id<MTLDepthStencilState> g_dss; static id<MTLTexture> g_nodepth, g_near_tex; static id<MTLRenderPipelineState> g_near_pso;
+static id<MTLComputePipelineState> g_align_pso; static id<MTLBuffer> g_alignment;
 static float g_screen_w = 3.2f, g_screen_d = 2.5f, g_strength = 1;
 static _Atomic int g_recenter = 1;
 static pthread_mutex_t g_conv_mu = PTHREAD_MUTEX_INITIALIZER; static float g_conv, g_hud = 1; static double g_conv_t; static uint64_t g_conv_seq;   // the screen's plane (w), smoothed; the share of the picture overlays cover; the frame they were last measured on
@@ -50,6 +51,9 @@ static int st_setup(void) {
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatRG32Float; pd.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
     g_near_pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e];
     if (!g_near_pso) { ILOG("[RED] no pipeline for the depth grid: %s", e.localizedDescription.UTF8String); return 0; }
+    g_align_pso = [g_dev newComputePipelineStateWithFunction:[g_lib newFunctionWithName:@"align_depth"] error:&e];
+    g_alignment = [g_dev newBufferWithLength:4 options:MTLResourceStorageModePrivate];
+    if (!g_align_pso || !g_alignment) { ILOG("[RED] no depth alignment pipeline or buffer: %s", e.localizedDescription.UTF8String); return 0; }
     g_q = [g_dev newCommandQueue];
     const char *s = getenv("DM_IMMERSIVE_SCREEN"); float w, d;
     if (s && sscanf(s, "%f,%f", &w, &d) == 2 && w >= 0.3f && w <= 30 && d >= 0.3f && d <= 30) { g_screen_w = w; g_screen_d = d; } else if (s) ILOG("[RED] DM_IMMERSIVE_SCREEN=%s is not <width m>,<distance m> (0.3 to 30)", s);
@@ -79,10 +83,27 @@ static st_u st_uniforms(const mtl_stereo_frame *f, simd_float4x4 mvp, int eye, u
 }
 static void st_draw(id<MTLRenderCommandEncoder> en, const mtl_stereo_frame *f, const st_u *u) {
     [en setVertexBytes:u length:sizeof *u atIndex:0]; [en setFragmentBytes:u length:sizeof *u atIndex:0];
+    [en setFragmentBuffer:g_alignment offset:0 atIndex:1];
     [en setFragmentTexture:(__bridge id<MTLTexture>)f->color atIndex:0]; [en setFragmentTexture:f->depth ? (__bridge id<MTLTexture>)f->depth : g_nodepth atIndex:1];
     [en setFragmentTexture:(__bridge id<MTLTexture>)(f->base ?: f->color) atIndex:2];
     [en setFragmentSamplerState:g_ls atIndex:0]; [en setFragmentSamplerState:g_ns atIndex:1];
     [en drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+}
+// Encoded before the eye draws, in the same command buffer: orientation belongs to
+// this frame, with no CPU readback or previous-frame calibration during a camera cut.
+static void align_update(id<MTLCommandBuffer> cb, const mtl_stereo_frame *f) {
+    uint32_t fallback = f->depth_flip != 0;
+    if (!f->reference || !f->depth) {
+        id<MTLBlitCommandEncoder> en = [cb blitCommandEncoder];
+        [en fillBuffer:g_alignment range:NSMakeRange(0, 4) value:(uint8_t)fallback];
+        [en endEncoding]; return;
+    }
+    id<MTLComputeCommandEncoder> en = [cb computeCommandEncoder];
+    [en setComputePipelineState:g_align_pso];
+    [en setTexture:(__bridge id<MTLTexture>)(f->base ?: f->color) atIndex:0];
+    [en setTexture:(__bridge id<MTLTexture>)f->reference atIndex:1];
+    [en setBuffer:g_alignment offset:0 atIndex:0]; [en setBytes:&fallback length:4 atIndex:1];
+    [en dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)]; [en endEncoding];
 }
 // Where the screen's plane lies in a frame's scene: the 90th percentile of the grid's nearest w, so what is nearest the camera (the ground at the player's feet) lies at the screen or
 // a little in front of it and everything else behind. 0 when under a twentieth of the grid holds anything (a menu over a cleared depth): flat
@@ -138,6 +159,7 @@ id<MTLBuffer> dm_immersive_eyes(const mtl_stereo_frame *f, int measure, NSUInteg
     id<MTLBuffer> px = [g_dev newBufferWithLength:w * h * 8 options:MTLResourceStorageModeShared];
     if (!out || !zt || !pso || !px) { ILOG("[RED] both eyes' pictures: no texture, pipeline or buffer"); return nil; }
     id<MTLCommandBuffer> cb = [g_q commandBuffer];
+    align_update(cb, f);
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor new];
     rp.colorAttachments[0].texture = out; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     rp.depthAttachment.texture = zt; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionDontCare; rp.renderTargetArrayLength = 2;
@@ -195,6 +217,7 @@ static void render_drawable(cp_drawable_t dr, ar_world_tracking_provider_t wt, c
         if (tracked && (atomic_exchange(&g_recenter, 0) || !placed)) { at = head; placed = 1; aspect = 0; }
         if (placed && fabsf(a - aspect) > 1e-3f) { model = screen_model(at, a); aspect = a; }   // a picture of another shape keeps the screen's place and width
         conv_update(cb, f, 0);
+        align_update(cb, f);
     }
     size_t nv = cp_drawable_get_view_count(dr), nt = cp_drawable_get_texture_count(dr), nr = cp_drawable_get_rasterization_rate_map_count(dr);
     float conv = conv_now(); int hud = hud_now() <= HUD_MAX;

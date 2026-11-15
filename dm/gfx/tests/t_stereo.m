@@ -25,11 +25,11 @@ static id<MTLTexture> make(MTLPixelFormat pf, NSUInteger w, NSUInteger h) {
     id<MTLTexture> t = [g_dev newTextureWithDescriptor:d]; res_add(t); return t;
 }
 // A frame as the replay sees it: a pass over colour and depth with n depth-writing draws, then the present
-static uint64_t frame(id<MTLTexture> color, id<MTLTexture> depth, int n, int func, id<MTLTexture> decoy) {
+static uint64_t frame_scene(id<MTLTexture> color, id<MTLTexture> depth, int n, int func, id<MTLTexture> decoy, id<MTLTexture> scene) {
     MTL4RenderPassDescriptor *pd = [MTL4RenderPassDescriptor new];
     S.ds.dt = S.ds.dw = 1; S.ds.df = func; S.has_vp = 1; S.vp[0][0] = S.vp[0][1] = 0;
     if (decoy) { pd.colorAttachments[0].texture = color; pd.depthAttachment.texture = decoy; S.vp[0][2] = decoy.width; S.vp[0][3] = decoy.height; st_pass(pd); for (int i = 0; i < n / 2; i++) st_draw(); }
-    if (depth) { pd.colorAttachments[0].texture = color; pd.depthAttachment.texture = depth; S.vp[0][2] = W; S.vp[0][3] = H; st_pass(pd); for (int i = 0; i < n; i++) st_draw(); }
+    if (depth) { pd.colorAttachments[0].texture = scene; pd.depthAttachment.texture = depth; S.vp[0][2] = W; S.vp[0][3] = H; st_pass(pd); for (int i = 0; i < n; i++) st_draw(); }
     pd.colorAttachments[0].texture = nil; pd.depthAttachment.texture = decoy ?: depth; st_pass(pd); for (int i = 0; i < 4 * n; i++) st_draw();   // a shadow map's pass: no colour, never the scene
     res_commit();
     uint64_t seq0 = g_st_pub.seq;
@@ -38,6 +38,9 @@ static uint64_t frame(id<MTLTexture> color, id<MTLTexture> depth, int n, int fun
     for (int i = 0; i < 400 && g_st_pub.seq == seq0; i++) usleep(5000);
     CHECK(g_st_pub.seq != seq0, "a present's picture is published within 2 s");
     return tag;
+}
+static uint64_t frame(id<MTLTexture> color, id<MTLTexture> depth, int n, int func, id<MTLTexture> decoy) {
+    return frame_scene(color, depth, n, func, decoy, color);
 }
 // The centre column of one channel's brightness in columns x0..x1 of a row of an eye's picture
 static double column_in(const uint8_t *px, int eye, int row, int ch, int x0, int x1) {
@@ -88,6 +91,54 @@ int main(void) { @autoreleasepool {
         mtl_stereo_frame g; CHECK(mtl_stereo_acquire(&g) && g.c != hc && (g.d < 0 || g.d != hd), "%s: later frames leave a pinned frame's slots alone (colour %d then %d, depth %d then %d)", nm, hc, g.c, hd, g.d);
         mtl_stereo_release(&g); mtl_stereo_release(&f);
     }
+    // The scene and its depth are rendered upside down, then postprocessing flips
+    // only the colour into the window. The tap must carry enough information to
+    // align depth with that final colour, without changing the window origin.
+    {
+        id<MTLTexture> picture = make(MTLPixelFormatRGBA8Unorm, W, H);
+        id<MTLTexture> scene = make(MTLPixelFormatRGBA8Unorm, W, H), flipped = make(MTLPixelFormatDepth32Float, W, H);
+        uint8_t *rc = malloc(W * H * 4); float *rz = malloc(W * H * sizeof *rz);
+        // An asymmetric scene with detail at the reference grid's scale.
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++) {
+            uint8_t *p = rc + (y * W + x) * 4;
+            p[0] = 20 + y * 120 / H; p[1] = 20 + (x / 32 % 2) * 20; p[2] = 10; p[3] = 255;
+        }
+        fill(picture, rc, 4);
+        uint8_t row[W * 4];
+        for (int y = 0; y < H / 2; y++) {
+            memcpy(row, rc + y * W * 4, W * 4);
+            memcpy(rc + y * W * 4, rc + (H - 1 - y) * W * 4, W * 4);
+            memcpy(rc + (H - 1 - y) * W * 4, row, W * 4);
+        }
+        fill(scene, rc, 4);
+        for (int reverse = 0; reverse < 2; reverse++) {
+            const float *source = reverse ? zr : z;
+            for (int y = 0; y < H; y++) memcpy(rz + y * W, source + (H - 1 - y) * W, W * sizeof *rz);
+            fill(flipped, rz, 4);
+            int func = reverse ? NVN_DEPTH_FUNC_GEQUAL : NVN_DEPTH_FUNC_LEQUAL;
+            frame(picture, reverse ? rdepth : depth, 40, func, nil);
+            CHECK(mtl_stereo_acquire(&f) && f.reference, "alignment: upright scene has a reference (reverse %d)", reverse);
+            NSUInteger ew, eh, aw, ah;
+            id<MTLBuffer> expected = dm_immersive_eyes(&f, 1, &ew, &eh);
+            mtl_stereo_release(&f);
+            frame_scene(picture, flipped, 40, func, nil, scene);
+            CHECK(mtl_stereo_acquire(&f) && f.reference && !f.depth_flip, "alignment: inverted scene has its own reference, despite an upper-left window (reverse %d)", reverse);
+            id<MTLBuffer> actual = dm_immersive_eyes(&f, 1, &aw, &ah);
+            CHECK(expected && actual && ew == aw && eh == ah && !memcmp(expected.contents, actual.contents, ew * eh * 8),
+                  "alignment: both eyes match the upright scene after an offscreen Y flip (reverse %d)", reverse);
+            // A constant scene cannot distinguish the mappings: retain the declared
+            // orientation. This also checks that a previous frame's decision is not reused.
+            float blank[32 * 18] = {0}; id<MTLTexture> ref = make(MTLPixelFormatR32Float, 32, 18); fill(ref, blank, 4);
+            f.reference = (__bridge void *)ref; f.depth_flip = 1;
+            actual = dm_immersive_eyes(&f, 0, &aw, &ah);
+            CHECK(expected && actual && !memcmp(expected.contents, actual.contents, ew * eh * 8), "alignment: ambiguous reference uses this frame's declared origin (reverse %d)", reverse);
+            f.reference = NULL;
+            actual = dm_immersive_eyes(&f, 0, &aw, &ah);
+            CHECK(expected && actual && !memcmp(expected.contents, actual.contents, ew * eh * 8), "alignment: absent reference uses this frame's declared origin (reverse %d)", reverse);
+            mtl_stereo_release(&f);
+        }
+        free(rc); free(rz);
+    }
     // A frame without a scene (a 2D game): the picture alone, drawn flat
     uint64_t tag = frame(color, nil, 0, NVN_DEPTH_FUNC_LEQUAL, nil);
     CHECK(tag == 0, "a frame without depth-writing draws has no depth copy");
@@ -133,6 +184,27 @@ int main(void) { @autoreleasepool {
                 CHECK(!ghost, "HUD: no copy of the bar where the far band moves (left eye, columns 590..599)");
             }
             mtl_stereo_release(&f);
+        }
+    }
+    // Alpha in the game's opaque present is not visible. An alpha-only triangle must not
+    // split the scene into HUD and scene depths along its diagonal.
+    {
+        id<MTLTexture> alpha = make(MTLPixelFormatRGBA8Unorm, W, H);
+        for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+            c[(y * W + x) * 4 + 3] = x < y * 2 ? 255 : 0;
+        fill(alpha, c, 4);
+        mtl_stereo_frame plain = {.color = (__bridge void *)color, .depth = (__bridge void *)depth,
+                                 .depth_rect = {0, 0, 1, 1}, .seq = UINT64_MAX - 1};
+        NSUInteger w0, h0, w1, h1;
+        id<MTLBuffer> expected = dm_immersive_eyes(&plain, 1, &w0, &h0);
+        plain.color = (__bridge void *)alpha; plain.base = (__bridge void *)color; plain.seq++;
+        id<MTLBuffer> actual = dm_immersive_eyes(&plain, 1, &w1, &h1);
+        CHECK(expected && actual && w0 == w1 && h0 == h1, "alpha-only triangle: both eyes are drawn");
+        if (expected && actual && w0 == w1 && h0 == h1) {
+            const uint8_t *a = actual.contents, *b = expected.contents; size_t changed = 0;
+            for (NSUInteger i = 0; i < 2 * w0 * h0; i++)
+                if (a[4 * i] != b[4 * i] || a[4 * i + 1] != b[4 * i + 1] || a[4 * i + 2] != b[4 * i + 2]) changed++;
+            CHECK(changed == 0, "alpha-only triangle: invisible alpha leaves scene geometry unchanged (%zu RGB pixels changed)", changed);
         }
     }
     mtl_drain();
