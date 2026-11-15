@@ -68,7 +68,7 @@ jobs:
 
       - name: Build IPA (provisional profile — Bomberman has no profile in dm/games)
         run: |
-          python3 scripts/build_ipa_from_nsp.py ~/Games/Bomberman -k ~/keys-prod.keys --romfs separate --progress lines
+          python3 scripts/build_ipa_from_nsp.py ~/Games/Bomberman -k ~/keys-prod.keys --romfs separate --allow-other-metal --progress lines
           ls -lh ~/Games/Bomberman/*.ipa ~/Games/Bomberman/*_build/ 2>/dev/null || true
 
       - name: Upload IPA
