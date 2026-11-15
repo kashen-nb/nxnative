@@ -2,6 +2,25 @@
 
 The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. Each entry: symptom, cause, fix, the games it was found on. The [symptom index](../agents/symptoms.md) lists every symptom.
 
+## Stereo presentation
+
+### Scene depth inverted by the final composite
+
+- **Symptom:** VR-only diagonal breaks and sideways steps across walls, roofs and windows; the ordinary Mac picture is intact.
+- **Cause:** the stereo tap copied the offscreen scene depth and assumed its row order followed the device's window origin. DREDGE renders the scene upside down and its final composite flips the colour upright. The copied depth stayed upside down, so unrelated silhouettes determined the parallax of visible geometry. A captured Greater Marrow frame showed this directly; flipping only its depth removed the breaks.
+- **Fix:** retain a 32x18 log-luminance reference of the colour attachment drawn with the selected depth, cropped to the same viewport. Before each pair of eye draws, a GPU reduction compares that reference with the final picture before HUD overlays in both row orders. A strong, distinct correlation selects the depth orientation; flat, unrelated or absent references retain the declared origin. The reference shares the depth slot's GPU ordering and reader pin. This uses the rendered scene, with no game or engine key, no CPU wait and no previous-frame orientation.
+- **Check:** `t_stereo` covers upright and inverted offscreen scenes with both depth conventions, ambiguous and absent references, real HUD overlays, invisible alpha differences and pinned frames (68 checks). Replaying the captured DREDGE harbor through automatic alignment matches the verified flipped-depth result exactly in both eyes (zero differing RGB pixels); the title scene also identifies the flipped mapping (luminance correlation about 0.97 versus 0.11 upright).
+- **Found on:** DREDGE (`01008CD0172D6000`, 1.5.3, local provisional profile), Mac gameplay and same-frame GPU replay. Untitled Goose Game (`010082400BCC6000`, local provisional profile) also has inverted depth, but its chosen depth is paired with a surface-normal target; that reference does not match the visible picture strongly enough, so automatic alignment retains the declared origin. Its reported distortion remains open. Physical headset retesting of DREDGE remains open.
+- **Open:** a postprocess that destroys the reference's spatial correspondence, a colour attachment that is not a scene image, or an image with too little distinguishing detail cannot establish orientation. The fallback retains the window convention; arbitrary rotations and nonlinear postprocess warps are not reconstructed.
+
+### Invisible alpha changes mistaken for HUD overlays
+
+- **Symptom:** geometry splits at a diagonal mask boundary in the VR picture even though the visible source picture is unchanged.
+- **Cause:** `stereo.metal` compared all four channels of the present and the picture before overlays. Alpha is invisible in this opaque presentation, but an alpha-only difference classified a scene pixel as HUD and moved it to the nearest parallax instead of the scene's depth.
+- **Fix:** compare RGB only, both when measuring the overlay coverage and when compositing each eye. Visible HUD changes still take the foreground depth.
+- **Found on:** a synthetic reproduction while investigating VR-only distortion reported in DREDGE (`01008CD0172D6000`) and Untitled Goose Game (`010082400BCC6000`), which have local provisional profiles. This is a separate compositor defect; it did not resolve the reported DREDGE distortion, whose cause is [the inverted scene depth](#scene-depth-inverted-by-the-final-composite).
+- **Check:** `t_stereo` draws identical RGB with a triangular alpha difference. Before the fix, 2,190 output pixels changed; after it, both eyes' RGB matches the frame without the invisible overlay exactly. The existing visible-HUD, scene-depth, reversed-depth and pinned-frame tests also pass (54 checks).
+
 ## Textures and formats
 
 ### Null textures in diagnostic logs
