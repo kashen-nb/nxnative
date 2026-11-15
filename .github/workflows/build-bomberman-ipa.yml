@@ -68,7 +68,7 @@ jobs:
 
       - name: Build IPA (provisional profile — Bomberman has no profile in dm/games)
         run: |
-          python3 scripts/build_ipa_from_nsp.py ~/Games/Bomberman -k ~/keys-prod.keys --progress lines
+          python3 scripts/build_ipa_from_nsp.py ~/Games/Bomberman -k ~/keys-prod.keys --romfs separate --progress lines
           ls -lh ~/Games/Bomberman/*.ipa ~/Games/Bomberman/*_build/ 2>/dev/null || true
 
       - name: Upload IPA
@@ -88,4 +88,15 @@ jobs:
             ~/Games/Bomberman/*_survey/
             ~/Games/Bomberman/*_build/profile/
             ~/Games/Bomberman/*_build/logs/
+          if-no-files-found: warn
+
+      - name: Upload RomFS data pack (romfs.img, goes in the app's Documents as romfs.img)
+        run: cp ~/Games/Bomberman/*_build/extract/*/RomFS.img ~/Games/Bomberman/romfs.img && ls -lh ~/Games/Bomberman/romfs.img
+
+      - name: Upload bomberman-romfs artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bomberman-romfs
+          path: ~/Games/Bomberman/romfs.img
           if-no-files-found: warn
