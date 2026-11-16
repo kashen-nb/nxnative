@@ -56,7 +56,7 @@ def fixups_keys(path):   # '# KEY<TAB>value' header rows of a rewriter table, as
     return {m[1]: m[2].strip() for m in re.finditer(r'^# (\w+)\t(.*)$', path.read_text(encoding='utf-8'), re.M)}
 
 
-UNKNOWN_LANGUAGES = 'This game\'s files do not list its languages, so some of these may not be in the game. It may then show another one.'
+UNKNOWN_LANGUAGES = '该游戏的文件没有列出它支持的语言，所以其中一些可能并不在游戏中，游戏到时可能显示另一种语言。'
 
 
 def build(gid, patched, control):
