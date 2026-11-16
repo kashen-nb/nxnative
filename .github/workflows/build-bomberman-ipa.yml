@@ -36,7 +36,7 @@ jobs:
       - name: Checkout nxnative
         uses: actions/checkout@v4
         with:
-          repository: seedds/nxnative
+          repository: kashen-nb/nxnative
           ref: main
 
       - name: Select Xcode 27.2
