@@ -13,7 +13,14 @@ struct Setting: Decodable, Identifiable {
     let min, max, step: Double?   // range
     let on, off: String?   // toggle: the values the variable takes (1 / 0 when not given)
     var id: String { env }
-    var sectionTitle: String { section ?? "Game" }
+    var sectionTitle: String {
+        switch section ?? "Game" {
+        case "Game": return "游戏"
+        case "Controls": return "操作"
+        case "Performance": return "性能"
+        default: return section ?? "游戏"
+        }
+    }
     var basic: Bool { level == "basic" }
     var onValue: String { on ?? "1" }
     var offValue: String { off ?? "0" }
