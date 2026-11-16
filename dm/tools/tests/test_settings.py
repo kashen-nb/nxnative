@@ -18,7 +18,7 @@ class ResolutionSetting(unittest.TestCase):
                 if dr:self.assertEqual((dr[0]['kind'],dr[0]['default']),('toggle','0'))
                 fps=next(s for s in rows if s['env']=='DM_FPS_TARGET')
                 self.assertEqual(fps['default'],'60')
-                self.assertEqual(fps['options'],[['30','30 fps'],['60','60 fps']])
+                self.assertEqual(fps['options'],[['30','30 帧'],['60','60 帧']])
 
 class FrameRateOption(unittest.TestCase):
     def test_120_only_on_the_mac_for_a_game_checked_at_that_speed(self):
@@ -28,7 +28,7 @@ class FrameRateOption(unittest.TestCase):
                 with patch.dict(settings.os.environ,{'SETTINGS_PLATFORM':platform}):
                     fps=next(s for s in settings.build(gid,tmp,'unused')['settings'] if s['env']=='DM_FPS_TARGET')
                 self.assertEqual(fps['default'],'60',gid)
-                self.assertEqual(fps['options'],[['30','30 fps'],['60','60 fps']]+([['120','120 fps']] if has else []),(gid,platform))
+                self.assertEqual(fps['options'],[['30','30 帧'],['60','60 帧']]+([['120','120 帧']] if has else []),(gid,platform))
 
 class UpscalerSetting(unittest.TestCase):
     def test_only_for_games_naming_their_upscaler(self):
@@ -37,6 +37,6 @@ class UpscalerSetting(unittest.TestCase):
             for gid,shown in [('040074A01BF12000',True),('040077201BE50000',True),('010056B015FE8000',False)]:   # Donkey Kong Bananza (agl's NDSR pack), Kirby Air Riders (the pack under its own name), NieR:Automata (none)
                 up=[s for s in settings.build(gid,tmp,'unused')['settings'] if s['env']=='DM_UPSCALER']
                 self.assertEqual(bool(up),shown,gid)
-                if up:self.assertEqual((up[0]['default'],up[0]['options']),('game',[['game',"Game's own"],['metalfx','MetalFX']]))
+                if up:self.assertEqual((up[0]['default'],up[0]['options']),('game',[['game','游戏自带'],['metalfx','MetalFX']]))
 
 if __name__=='__main__':unittest.main()
