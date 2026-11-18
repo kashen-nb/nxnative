@@ -1,37 +1,22 @@
-# Bomberman R 2 standalone IPA — GitHub Actions, macOS runner, no local Mac needed
-# Repo: kashen-nb/nxnative, file at .github/workflows/build-bomberman-ipa.yml
-# Game parts are in Mega folder https://mega.nz/folder/xBdHVaCD#OhRJFQjWYF7_W4jWH03QSw
-# (3 files, total 5.11 GB: bomberman.xci.part-~aa 1.86 GB, part-~ab 1.86 GB, part-~ac 1.4 GB)
-# Never push game files or prod.keys to a public repo.
-#
-# 3. Put prod.keys in GitHub Secrets as a base64 secret named PROD_KEYS_B64:
-#    certutil -encode prod.keys prod.keys.b64  (Windows) — paste the b64 text, no newlines, into the secret.
-#    Never put prod.keys in the repo, in an issue, or in a public link.
-# 4. Run this workflow (Actions > Build Bomberman IPA > Run workflow).
-# 5. Download the IPA from the run's Artifacts. Sign it with Sideloadly / AltStore.
-#    iPhone needs iOS 26+, A17 Pro or newer. Bomberman has NO profile in
-#    nxnative dm/games/, so this is a provisional build — it may not boot.
-#    The survey + provisional profile are uploaded as artifacts too.
+# Bomberman R 2 standalone IPA, run #10 — IPA-only, rebuilt from run #8 artifacts
+# No XCI re-upload: the survey (ExeFS + profile + icon) and the romfs.img come
+# from GitHub Actions run #8 (43708038569), whose artifacts are still available.
+# The game is reassembled as a dump folder (exefs/ + unpacked romfs/) —
+# a dump needs no prod.keys. Includes the friend:u fix and the Chinese
+# launcher (main @ ec04c2f). Only the IPA is uploaded; romfs.img already
+# lives in the app's Documents on the phone.
 name: Build Bomberman IPA
 
 on:
   workflow_dispatch:
-    inputs:
-      mega_folder_url:
-        description: 'Mega folder URL with the 3 XCI parts'
-        required: false
-        default: 'https://mega.nz/folder/xBdHVaCD#OhRJFQjWYF7_W4jWH03QSw'
-        type: string
-      game_filename:
-        description: 'Reassembled XCI filename'
-        required: false
-        default: 'SUPER BOMBERMAN R 2 [0100B87017D94000] [v393216].xci'
-        type: string
 
 jobs:
   build:
     runs-on: xcode-27
     timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Checkout nxnative
         uses: actions/checkout@v4
@@ -48,48 +33,81 @@ jobs:
 
       - name: Install build tools
         run: |
-          brew install xcodegen zstd glslang megatools
+          brew install xcodegen zstd glslang
           python3 -m pip install --break-system-packages lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'"
 
-      - name: Download and reassemble XCI from Mega folder
-        run: |
-          mkdir -p ~/Games/Bomberman/parts
-          megadl --path ~/Games/Bomberman/parts "${{ inputs.mega_folder_url }}"
-          ls -lh ~/Games/Bomberman/parts/
-          cat ~/Games/Bomberman/parts/bomberman.xci.part-* > ~/Games/Bomberman/"${{ inputs.game_filename }}"
-          ls -lh ~/Games/Bomberman/
-          rm -rf ~/Games/Bomberman/parts
+      - name: Download run #8 survey artifact (ExeFS + profile + icon)
+        uses: actions/download-artifact@v4
+        with:
+          name: bomberman-survey
+          run-id: 43708038569
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ~/Games/Bomberman/survey
 
-      - name: Restore prod.keys from secret
-        run: |
-          echo "${{ secrets.PROD_KEYS_B64 }}" | base64 -d > ~/keys-prod.keys
-          ls -l ~/keys-prod.keys
-        env:
-          PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
-
-      - name: Build IPA (provisional profile — Bomberman has no profile in dm/games)
-        run: |
-          python3 scripts/build_ipa_from_nsp.py ~/Games/Bomberman -k ~/keys-prod.keys --romfs separate --allow-other-metal --progress lines
-          ls -lh ~/Games/Bomberman/*.ipa ~/Games/Bomberman/*_build/ 2>/dev/null || true
-
-      - name: Upload RomFS data pack (romfs.img, goes in the app's Documents as romfs.img)
-        if: always()
-        run: cp ~/Games/Bomberman/*_build/extract/*/RomFS.img ~/Games/Bomberman/romfs.img && ls -lh ~/Games/Bomberman/romfs.img
-
-      - name: Upload bomberman-romfs artifact
-        uses: actions/upload-artifact@v4
-        if: always()
+      - name: Download run #8 romfs artifact (romfs.img)
+        uses: actions/download-artifact@v4
         with:
           name: bomberman-romfs
-          path: ~/Games/Bomberman/romfs.img
-          if-no-files-found: warn
+          run-id: 43708038569
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ~/Games/Bomberman/romfs-dl
+
+      - name: Assemble dump folder (exefs + unpacked romfs)
+        run: |
+          set -e
+          SURVEY=~/Games/Bomberman/survey/0100B87017D94000_survey
+          ls -lh "$SURVEY/extract/ExeFS/" "$SURVEY/extract/icon.jpg"
+          ls -lh ~/Games/Bomberman/romfs-dl/romfs.img
+          mkdir -p ~/Games/Bomberman/"SUPER BOMBERMAN R 2"/exefs
+          cp "$SURVEY/extract/ExeFS/"* ~/Games/Bomberman/"SUPER BOMBERMAN R 2"/exefs/
+          python3 - <<'EOF'
+          import os, sys
+          sys.path.insert(0, 'dm/tools')
+          import romfs_image
+          img = os.path.expanduser('~/Games/Bomberman/romfs-dl/romfs.img')
+          out = os.path.expanduser('~/Games/Bomberman/SUPER BOMBERMAN R 2/romfs')
+          idx = romfs_image.read_index(img)
+          print('romfs entries:', len(idx))
+          with open(img, 'rb') as f:
+              for path, (is_dir, off, size) in sorted(idx.items()):
+                  dst = os.path.join(out, path)
+                  if is_dir:
+                      os.makedirs(dst, exist_ok=True)
+                  else:
+                      os.makedirs(os.path.dirname(dst), exist_ok=True)
+                      f.seek(off)
+                      with open(dst, 'wb') as g:
+                          remaining = size
+                          while remaining:
+                              chunk = f.read(min(remaining, 1 << 20))
+                              if not chunk:
+                                  break
+                              g.write(chunk)
+                              remaining -= len(chunk)
+          print('unpacked to', out)
+          EOF
+          rm -f ~/Games/Bomberman/romfs-dl/romfs.img
+          ls ~/Games/Bomberman/"SUPER BOMBERMAN R 2"/exefs/
+          du -sh ~/Games/Bomberman/"SUPER BOMBERMAN R 2"/romfs
+
+      - name: Build IPA from dump (friend:u fix + Chinese launcher, IPA only)
+        run: |
+          python3 scripts/build_ipa_from_nsp.py ~/Games/Bomberman/"SUPER BOMBERMAN R 2" --icon ~/Games/Bomberman/survey/0100B87017D94000_survey/extract/icon.jpg --romfs separate --allow-other-metal --progress lines
+          find ~/Games/Bomberman -name '*.ipa' -o -name '*_build' -type d | head -20
+
+      - name: Collect IPA
+        if: always()
+        run: |
+          mkdir -p ~/Games/Bomberman/out
+          find ~/Games/Bomberman -name '*.ipa' -not -path '*/out/*' -exec cp {} ~/Games/Bomberman/out/ \;
+          ls -lh ~/Games/Bomberman/out/
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bomberman-ipa
-          path: ~/Games/Bomberman/*.ipa
+          path: ~/Games/Bomberman/out/*.ipa
           if-no-files-found: warn
 
       - name: Upload survey and provisional profile (for debugging if it does not boot)
@@ -98,7 +116,6 @@ jobs:
         with:
           name: bomberman-survey
           path: |
-            ~/Games/Bomberman/*_survey/
-            ~/Games/Bomberman/*_build/profile/
-            ~/Games/Bomberman/*_build/logs/
+            ~/Games/Bomberman/**/profile/
+            ~/Games/Bomberman/**/logs/
           if-no-files-found: warn
